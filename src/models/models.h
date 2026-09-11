@@ -2256,17 +2256,20 @@ struct llama_model_qwen3next : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
         ggml_tensor * build_layer_attn(
-        llm_graph_input_attn_kv * inp_attn,
+        llm_graph_input_attn_kv *  inp_attn,
+      const struct llama_layer &  layer,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
+      const struct llama_layer &  layer,
                     ggml_tensor * cur,
                             int   il);
 
         ggml_tensor * build_layer_ffn(
+      const struct llama_layer &  layer,
                     ggml_tensor * cur,
                             int   il);
 
@@ -2278,6 +2281,7 @@ struct llama_model_qwen3next : public llama_model_base {
 
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
+      const struct llama_layer &  layer,
                     ggml_tensor * input,
                             int   il);
 

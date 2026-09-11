@@ -54,16 +54,35 @@ bool llama_context::prefill_streaming_init() {
         return false;
     }
 
-    // the slots live on the device that holds layer 0
+    // the slots need a device that can run the layer ops and that supports events, so use an
+    // accelerator. -ngl does not have to have placed anything there: the slot buffer type is what
+    // routes the ops, see prefill_streaming_check_placement().
+    auto is_accel = [](ggml_backend_dev_t dev) {
+        if (dev == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        return props.type == GGML_BACKEND_DEVICE_TYPE_GPU || props.type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    };
+
     ggml_backend_t backend = nullptr;
     for (const auto & cur : backends) {
-        if (ggml_backend_get_device(cur.get()) == model.dev_layer(0)) {
+        if (ggml_backend_get_device(cur.get()) == model.dev_layer(0) && is_accel(ggml_backend_get_device(cur.get()))) {
             backend = cur.get();
             break;
         }
     }
+    if (backend == nullptr) {
+        for (const auto & cur : backends) {
+            if (is_accel(ggml_backend_get_device(cur.get()))) {
+                backend = cur.get();
+                break;
+            }
+        }
+    }
     if (!backend) {
-        LLAMA_LOG_WARN("%s: no backend for layer 0, streaming unavailable\n", __func__);
+        LLAMA_LOG_WARN("%s: no accelerator backend, streaming unavailable\n", __func__);
         return false;
     }
 
