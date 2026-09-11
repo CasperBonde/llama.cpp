@@ -181,6 +181,33 @@ bool llama_context::prefill_streaming_init() {
         }
     }
 
+    // a second backend instance for the same device gives us a stream that is independent of
+    // the compute stream, which is what makes the prefetch overlap with compute
+    ggml_backend_t copy_backend = nullptr;
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev != nullptr) {
+            copy_backend = ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    if (copy_backend == nullptr) {
+        LLAMA_LOG_WARN("%s: could not create a copy stream, streaming unavailable\n", __func__);
+        prefill_streaming_free();
+        return false;
+    }
+    prefill_streaming_copy_backend.reset(copy_backend);
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    prefill_streaming_slot_done.assign(2, nullptr);
+    for (int s = 0; s < 2; ++s) {
+        prefill_streaming_slot_done[s] = ggml_backend_event_new(dev);
+        if (prefill_streaming_slot_done[s] == nullptr) {
+            LLAMA_LOG_WARN("%s: could not create slot event %d\n", __func__, s);
+            prefill_streaming_free();
+            return false;
+        }
+    }
+
     prefill_streaming_maps      = std::move(maps);
     prefill_streaming_n_layer   = n_layer;
     prefill_streaming_slot_size = slot_size;
@@ -195,6 +222,16 @@ bool llama_context::prefill_streaming_init() {
 }
 
 void llama_context::prefill_streaming_free() {
+    for (auto & event : prefill_streaming_slot_done) {
+        if (event != nullptr) {
+            ggml_backend_event_free(event);
+            event = nullptr;
+        }
+    }
+    prefill_streaming_slot_done.clear();
+
+    prefill_streaming_copy_backend.reset();
+
     prefill_streaming_slots.clear();
     prefill_streaming_maps.clear();
     prefill_streaming_slot_size   = 0;
@@ -226,6 +263,13 @@ bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
         async = false;
     }
 
+    // LLAMA_PREFILL_STREAMING_SYNC: fall back to a blocking fill, used to validate the
+    // event ordering of the asynchronous prefetch against the simple version.
+    static const bool force_sync = getenv("LLAMA_PREFILL_STREAMING_SYNC") != nullptr;
+    if (force_sync) {
+        async = false;
+    }
+
     const int64_t t_fill_start = ggml_time_us();
     size_t fill_bytes = 0;
 
@@ -244,11 +288,19 @@ bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
             }
             ggml_backend_tensor_set(dst.layers[il][i], buf.data(), 0, size);
         } else if (async) {
-            // prefetch onto the compute stream, overlapping with the layer that is computing now
-            ggml_backend_tensor_set_async(prefill_streaming_backend, dst.layers[il][i], source->data, 0, size);
+            // issue the copy on a second stream so it runs while the compute stream keeps
+            // working on other layers. ordering back to the compute stream is done with an
+            // event when the slot is actually needed.
+            ggml_backend_tensor_set_async(prefill_streaming_copy_backend.get(),
+                    dst.layers[il][i], source->data, 0, size);
         } else {
             ggml_backend_tensor_set(dst.layers[il][i], source->data, 0, size);
         }
+    }
+
+    if (async) {
+        // record that this slot now holds layer il once the copy stream drains
+        ggml_backend_event_record(prefill_streaming_slot_done[slot], prefill_streaming_copy_backend.get());
     }
 
     prefill_streaming_fill_us    += ggml_time_us() - t_fill_start;
@@ -256,6 +308,24 @@ bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
     prefill_streaming_n_fill++;
 
     return true;
+}
+
+void llama_context::prefill_streaming_wait_slot(int slot, int il) const {
+    if (slot < 0 || slot >= (int) prefill_streaming_slot_done.size()) {
+        return;
+    }
+    if (prefill_streaming_slot_done[slot] == nullptr) {
+        return;
+    }
+
+    // the first two layers are seeded synchronously at ubatch start, so there is no
+    // outstanding prefetch to wait for
+    if (il < 2) {
+        return;
+    }
+
+    // make the compute stream wait for the prefetch instead of blocking the host
+    ggml_backend_event_wait(prefill_streaming_backend, prefill_streaming_slot_done[slot]);
 }
 
 // bind a layer weight tensor to its slot-backed counterpart. returns the input unchanged
@@ -309,13 +379,14 @@ bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
     }
 
     if (ask) {
-        LLAMA_LOG_DEBUG("%s: ask for layer %d\n", __func__, il);
+        // the range that is about to be submitted ends at this node, so it is the range
+        // that reads layer il's weights. make the compute stream wait for the prefetch.
+        prefill_streaming_wait_slot(il % 2, il);
         return true;
     }
-    LLAMA_LOG_DEBUG("%s: done layer %d\n", __func__, il);
 
-    // layer il is complete and the backend has been synchronized, so its slot is free.
-    // the slot that layer il used will next hold layer il + 2.
+    // layer il has finished computing and the backend was synchronized at the boundary.
+    // its slot is now free and will next hold layer il + 2.
     prefill_streaming_cur_layer = il;
 
     const int next = il + 2;
@@ -323,7 +394,10 @@ bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
         return true;
     }
 
-    if (!prefill_streaming_fill_slot(next % 2, next, true)) {
+    // issue the copy on the copy stream. this only enqueues, it does not wait, so the
+    // compute stream keeps running the next layer while the copy is in flight.
+    const int slot = next % 2;
+    if (!prefill_streaming_fill_slot(slot, next, true)) {
         LLAMA_LOG_ERROR("%s: failed to fill slot for layer %d\n", __func__, next);
         prefill_streaming_failed = true;
         return false;

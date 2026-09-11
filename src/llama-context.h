@@ -270,6 +270,7 @@ private:
     bool prefill_streaming_init();
     void prefill_streaming_free();
     bool prefill_streaming_fill_slot(int slot, int il, bool async);
+    void prefill_streaming_wait_slot(int slot, int il) const;
     ggml_tensor * prefill_streaming_bind(ggml_context * ctx, ggml_tensor * tensor, int il) const;
     bool prefill_streaming_sync_cb(ggml_tensor * t, bool ask);
     static bool prefill_streaming_sync_cb_trampoline(ggml_tensor * t, bool ask, void * user_data);
@@ -377,7 +378,9 @@ private:
     // [layer][tensor index] -> { source tensor, offset in slot }
     std::vector<std::vector<std::pair<const ggml_tensor *, size_t>>> prefill_streaming_maps;
 
-    ggml_backend_t prefill_streaming_backend = nullptr; // device that owns the slots
+    ggml_backend_t prefill_streaming_backend = nullptr;      // device that owns the slots
+    ggml_backend_ptr prefill_streaming_copy_backend;         // separate stream used for prefetch copies
+    std::vector<ggml_backend_event_t> prefill_streaming_slot_done; // per slot: copy has landed
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
