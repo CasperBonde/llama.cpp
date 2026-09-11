@@ -266,6 +266,17 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    // experimental prefill streaming: keep 2 layer slots in VRAM and stream layers through them
+    bool prefill_streaming_init();
+    void prefill_streaming_free();
+    bool prefill_streaming_fill_slot(int slot, int il, bool async);
+    ggml_tensor * prefill_streaming_bind(ggml_context * ctx, ggml_tensor * tensor, int il) const;
+    bool prefill_streaming_sync_cb(ggml_tensor * t, bool ask);
+    static bool prefill_streaming_sync_cb_trampoline(ggml_tensor * t, bool ask, void * user_data);
+
+    // sanity check that the streamed layers are actually computed on the slot device
+    void prefill_streaming_check_placement(ggml_cgraph * gf);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -345,6 +356,28 @@ private:
 
     bool sched_need_reserve = true;
 
+    // experimental prefill streaming state
+    struct prefill_streaming_slot {
+        ggml_context_ptr buffer_ctx;                     // owns the slot-backed tensor objects
+        ggml_backend_buffer_ptr buffer;                  // the VRAM storage shared by them
+        std::vector<std::vector<ggml_tensor *>> layers;  // [layer][tensor index]
+    };
+
+    bool prefill_streaming_enabled = false; // resolved at init: requested, supported and usable
+    bool prefill_streaming_failed  = false;
+    bool prefill_streaming_placement_checked = false; // report the placement warning only once
+    mutable bool prefill_streaming_bind_logged = false; // diagnostics only
+    size_t prefill_streaming_slot_size = 0;
+    int    prefill_streaming_n_layer = 0;
+    int    prefill_streaming_cur_layer = -1; // layer currently computing, -1 if none
+    size_t prefill_streaming_n_fill = 0;     // number of slot refills, for diagnostics
+    int64_t prefill_streaming_fill_us = 0;   // time spent refilling slots, for diagnostics
+    size_t prefill_streaming_fill_bytes = 0; // bytes copied into slots, for diagnostics
+    std::vector<prefill_streaming_slot> prefill_streaming_slots;
+    // [layer][tensor index] -> { source tensor, offset in slot }
+    std::vector<std::vector<std::pair<const ggml_tensor *, size_t>>> prefill_streaming_maps;
+
+    ggml_backend_t prefill_streaming_backend = nullptr; // device that owns the slots
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 

@@ -1491,6 +1491,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    tensor_bind      (params.tensor_bind),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {

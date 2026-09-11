@@ -38,6 +38,388 @@ struct llm_fused_op_probe {
     uint32_t n_tokens_per_seq;
 };
 
+// experimental prefill streaming
+//
+// keep two layer-sized slots in VRAM. for every layer tensor a slot-backed tensor with
+// the same type, shape and strides is created once at init. the graph binds the layer
+// weights to those slot tensors, so weights are read straight out of the slot on the
+// compute device.
+//
+// slots are refilled lazily. slot s is overwritten only after layer il has finished
+// computing, which is signalled by the scheduler eval callback on the layer's last node.
+// filling eagerly before submission would alias several layers onto the same storage.
+bool llama_context::prefill_streaming_init() {
+    const int n_layer = (int) model.hparams.n_layer_all;
+    if (n_layer <= 0) {
+        return false;
+    }
+
+    // the slots live on the device that holds layer 0
+    ggml_backend_t backend = nullptr;
+    for (const auto & cur : backends) {
+        if (ggml_backend_get_device(cur.get()) == model.dev_layer(0)) {
+            backend = cur.get();
+            break;
+        }
+    }
+    if (!backend) {
+        LLAMA_LOG_WARN("%s: no backend for layer 0, streaming unavailable\n", __func__);
+        return false;
+    }
+
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+
+    // work out the slot layout: every host-resident tensor of every layer needs an aligned offset.
+    // tensors that already live on the compute device are left alone, they are readable as is.
+    std::vector<std::vector<std::pair<const ggml_tensor *, size_t>>> maps(n_layer);
+
+    size_t n_tensors   = 0;
+    size_t n_bytes     = 0;
+    size_t slot_size   = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        const auto tensors = model.get_prefill_streaming_layer_tensors(il);
+        if (tensors.empty()) {
+            LLAMA_LOG_WARN("%s: layer %d has no tensors, streaming unavailable\n", __func__, il);
+            return false;
+        }
+
+        auto & map = maps[il];
+        map.reserve(tensors.size());
+
+        size_t offset = 0;
+        for (const auto * tensor : tensors) {
+            if (tensor->buffer == nullptr || !ggml_backend_buffer_is_host(tensor->buffer)) {
+                continue;
+            }
+
+            const size_t size = ggml_backend_buft_get_alloc_size(buft, tensor);
+            offset = GGML_PAD(offset, alignment);
+            map.emplace_back(tensor, offset);
+            offset += size;
+            n_bytes += ggml_nbytes(tensor);
+        }
+
+        n_tensors += map.size();
+        slot_size  = std::max(slot_size, offset);
+    }
+
+    if (n_tensors == 0) {
+        LLAMA_LOG_WARN("%s: no host resident layer tensors, streaming unavailable\n", __func__);
+        return false;
+    }
+
+    slot_size = GGML_PAD(slot_size, alignment);
+
+    prefill_streaming_slots.clear();
+    prefill_streaming_slots.resize(2);
+
+    for (int s = 0; s < 2; ++s) {
+        auto & slot = prefill_streaming_slots[s];
+
+        slot.buffer.reset(ggml_backend_buft_alloc_buffer(buft, slot_size));
+        if (!slot.buffer) {
+            LLAMA_LOG_WARN("%s: failed to allocate slot %d (%zu bytes)\n", __func__, s, slot_size);
+            prefill_streaming_free();
+            return false;
+        }
+
+        // mark the slots as weights so the scheduler routes ops that read them onto the slot device
+        if (getenv("LLAMA_PREFILL_STREAMING_NO_WEIGHTS") == nullptr) {
+            ggml_backend_buffer_set_usage(slot.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+
+        // quantized weights are zero-filled so a slot that is not yet valid cannot produce NaNs
+        ggml_backend_buffer_clear(slot.buffer.get(), 0);
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*n_tensors*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        slot.buffer_ctx.reset(ggml_init(params));
+        if (!slot.buffer_ctx) {
+            LLAMA_LOG_WARN("%s: failed to create context for slot %d\n", __func__, s);
+            prefill_streaming_free();
+            return false;
+        }
+
+        void * base = ggml_backend_buffer_get_base(slot.buffer.get());
+
+        slot.layers.resize(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            auto & views = slot.layers[il];
+            views.reserve(maps[il].size());
+
+            ggml_context * ctx = slot.buffer_ctx.get();
+
+            for (const auto & [source, offset] : maps[il]) {
+                ggml_tensor * view = ggml_new_tensor(ctx, source->type, GGML_MAX_DIMS, source->ne);
+                if (!view) {
+                    LLAMA_LOG_WARN("%s: failed to create slot tensor for %s\n",
+                            __func__, ggml_get_name(source));
+                    prefill_streaming_free();
+                    return false;
+                }
+
+                // preserve the exact quantized layout of the source
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    view->ne[i] = source->ne[i];
+                    view->nb[i] = source->nb[i];
+                }
+
+                if (ggml_backend_tensor_alloc(slot.buffer.get(), view, (char *) base + offset) != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_WARN("%s: failed to place slot tensor for %s\n",
+                            __func__, ggml_get_name(source));
+                    prefill_streaming_free();
+                    return false;
+                }
+
+                ggml_set_name(view, ggml_get_name(source));
+                views.push_back(view);
+            }
+        }
+    }
+
+    prefill_streaming_maps      = std::move(maps);
+    prefill_streaming_n_layer   = n_layer;
+    prefill_streaming_slot_size = slot_size;
+    prefill_streaming_cur_layer = -1;
+    prefill_streaming_n_fill    = 0;
+    prefill_streaming_backend   = backend;
+
+    LLAMA_LOG_INFO("%s: prefill streaming enabled, 2 slots of %.2f MiB, %d layers, %zu tensors\n",
+            __func__, slot_size/(1024.0*1024.0), n_layer, n_tensors);
+
+    return true;
+}
+
+void llama_context::prefill_streaming_free() {
+    prefill_streaming_slots.clear();
+    prefill_streaming_maps.clear();
+    prefill_streaming_slot_size   = 0;
+    prefill_streaming_n_layer     = 0;
+    prefill_streaming_cur_layer   = -1;
+    prefill_streaming_n_fill      = 0;
+    prefill_streaming_backend     = nullptr;
+}
+
+bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
+    if (slot < 0 || slot >= (int) prefill_streaming_slots.size()) {
+        return false;
+    }
+    if (il < 0 || il >= (int) prefill_streaming_maps.size()) {
+        return false;
+    }
+
+    auto & dst     = prefill_streaming_slots[slot];
+    auto & mapping = prefill_streaming_maps[il];
+
+    if (dst.layers[il].size() != mapping.size()) {
+        return false;
+    }
+
+    // LLAMA_PREFILL_STREAMING_CORRUPT: write nonsense into the slots instead of the weights.
+    // if the output does not change, the graph never reads the slots.
+    static const bool corrupt = getenv("LLAMA_PREFILL_STREAMING_CORRUPT") != nullptr;
+    if (corrupt) {
+        async = false;
+    }
+
+    const int64_t t_fill_start = ggml_time_us();
+    size_t fill_bytes = 0;
+
+    for (size_t i = 0; i < mapping.size(); ++i) {
+        const auto * source = mapping[i].first;
+
+        const size_t size = ggml_nbytes(source);
+        GGML_ASSERT(size == ggml_nbytes(dst.layers[il][i]));
+        fill_bytes += size;
+
+        if (corrupt) {
+            static std::vector<char> buf;
+            buf.assign(size, 0);
+            for (size_t j = 0; j < size; ++j) {
+                buf[j] = (char) (j * 31 + (size_t) il);
+            }
+            ggml_backend_tensor_set(dst.layers[il][i], buf.data(), 0, size);
+        } else if (async) {
+            // prefetch onto the compute stream, overlapping with the layer that is computing now
+            ggml_backend_tensor_set_async(prefill_streaming_backend, dst.layers[il][i], source->data, 0, size);
+        } else {
+            ggml_backend_tensor_set(dst.layers[il][i], source->data, 0, size);
+        }
+    }
+
+    prefill_streaming_fill_us    += ggml_time_us() - t_fill_start;
+    prefill_streaming_fill_bytes += fill_bytes;
+    prefill_streaming_n_fill++;
+
+    return true;
+}
+
+// bind a layer weight tensor to its slot-backed counterpart. returns the input unchanged
+// when streaming is not active or the tensor is not part of a streamed layer.
+ggml_tensor * llama_context::prefill_streaming_bind(ggml_context * ctx, ggml_tensor * tensor, int il) const {
+    GGML_UNUSED(ctx);
+
+    if (!prefill_streaming_enabled || tensor == nullptr || il < 0) {
+        return tensor;
+    }
+    if (il >= (int) prefill_streaming_maps.size()) {
+        return tensor;
+    }
+
+    const auto & mapping = prefill_streaming_maps[il];
+    for (size_t i = 0; i < mapping.size(); ++i) {
+        if (mapping[i].first == tensor) {
+            ggml_tensor * view = prefill_streaming_slots[il % 2].layers[il][i];
+            if (il < 2 && !prefill_streaming_bind_logged) {
+                LLAMA_LOG_DEBUG("%s: bound %s -> slot %d buffer %s\n", __func__,
+                        ggml_get_name(tensor), il % 2,
+                        ggml_backend_buffer_name(view->buffer));
+            }
+            return view;
+        }
+    }
+
+    // not a streamed weight (e.g. a bias that lives elsewhere) - leave it alone
+    return tensor;
+}
+
+// scheduler eval callback used to refill the slots.
+//
+// returning true on the last node of layer il makes the scheduler compute that layer as
+// its own range and synchronize the backend afterwards. the following call with
+// ask == false is therefore the safe point to overwrite the other slot.
+bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
+    if (!prefill_streaming_enabled) {
+        return false;
+    }
+
+    // layer boundary nodes are named "l_out-<il>" by llm_graph_context::cb
+    const char * name = ggml_get_name(t);
+    if (name == nullptr || strncmp(name, "l_out-", 6) != 0) {
+        return false;
+    }
+
+    const int il = atoi(name + 6);
+    if (il < 0 || il >= prefill_streaming_n_layer) {
+        return false;
+    }
+
+    if (ask) {
+        LLAMA_LOG_DEBUG("%s: ask for layer %d\n", __func__, il);
+        return true;
+    }
+    LLAMA_LOG_DEBUG("%s: done layer %d\n", __func__, il);
+
+    // layer il is complete and the backend has been synchronized, so its slot is free.
+    // the slot that layer il used will next hold layer il + 2.
+    prefill_streaming_cur_layer = il;
+
+    const int next = il + 2;
+    if (next >= prefill_streaming_n_layer) {
+        return true;
+    }
+
+    if (!prefill_streaming_fill_slot(next % 2, next, true)) {
+        LLAMA_LOG_ERROR("%s: failed to fill slot for layer %d\n", __func__, next);
+        prefill_streaming_failed = true;
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_context::prefill_streaming_sync_cb_trampoline(ggml_tensor * t, bool ask, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    return ctx->prefill_streaming_sync_cb(t, ask);
+}
+
+// Guard against the failure mode where the slot tensors are filled but the graph that reads
+// them ends up scheduled on the CPU. Checked once per context.
+void llama_context::prefill_streaming_check_placement(ggml_cgraph * gf) {
+    if (prefill_streaming_placement_checked) {
+        return;
+    }
+
+    // the slots all share one buffer type, so any allocated slot tensor identifies the device
+    ggml_backend_t slot_backend = nullptr;
+    if (!prefill_streaming_slots.empty()) {
+        const auto & slot = prefill_streaming_slots[0];
+        for (const auto & views : slot.layers) {
+            for (auto * view : views) {
+                slot_backend = ggml_backend_sched_get_tensor_backend(sched.get(), view);
+                if (slot_backend) { break; }
+            }
+            if (slot_backend) { break; }
+        }
+    }
+
+    int         n_slot_ops     = 0;
+    int         n_slot_ops_cpu = 0;
+    std::string cpu_op;
+    std::string off_device_op;
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+
+        bool uses_slot = false;
+        for (int j = 0; j < GGML_MAX_SRC && !uses_slot; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (src == nullptr || src->buffer == nullptr) {
+                continue;
+            }
+            for (const auto & slot : prefill_streaming_slots) {
+                if (slot.buffer && src->buffer == slot.buffer.get()) {
+                    uses_slot = true;
+                    break;
+                }
+            }
+        }
+
+        if (!uses_slot) {
+            continue;
+        }
+
+        n_slot_ops++;
+
+        ggml_backend_t op_backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+        if (op_backend == nullptr) {
+            continue;
+        }
+        if (op_backend == backend_cpu) {
+            n_slot_ops_cpu++;
+            if (cpu_op.empty()) { cpu_op = node->name; }
+        } else if (slot_backend && op_backend != slot_backend && off_device_op.empty()) {
+            off_device_op = node->name;
+        }
+    }
+
+    prefill_streaming_placement_checked = true;
+
+    if (n_slot_ops == 0) {
+        LLAMA_LOG_WARN("%s: prefill streaming is active but no op in the graph reads a slot tensor, "
+                "the slots are dead weight\n", __func__);
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: %d graph ops read slot tensors, %d of them scheduled on the CPU, slot device: %s\n",
+            __func__, n_slot_ops, n_slot_ops_cpu,
+            slot_backend ? ggml_backend_name(slot_backend) : "(unresolved)");
+
+    if (n_slot_ops_cpu > 0) {
+        LLAMA_LOG_WARN("%s: %d of %d slot consumers run on the CPU (first: %s), "
+                "streaming gets no speedup from those\n",
+                __func__, n_slot_ops_cpu, n_slot_ops, cpu_op.c_str());
+    }
+    if (!off_device_op.empty()) {
+        LLAMA_LOG_WARN("%s: slot consumer %s does not run on the slot device\n",
+                __func__, off_device_op.c_str());
+    }
+}
+
 static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
     /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
     /*.name             =*/ "Flash Attention",
@@ -270,6 +652,7 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
+    cparams.prefill_streaming = params.prefill_streaming;
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
@@ -481,6 +864,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    prefill_streaming_free();
+    prefill_streaming_enabled = false;
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -709,6 +1095,17 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    // experimental prefill streaming. opt-in via llama_context_params::prefill_streaming.
+    // it needs host-resident weights to stream from, so it is only enabled when every
+    // layer tensor lives in host memory.
+    if (cparams.prefill_streaming) {
+        if (prefill_streaming_init()) {
+            prefill_streaming_enabled = true;
+        } else {
+            LLAMA_LOG_WARN("%s: prefill streaming requested but unavailable, using the standard path\n", __func__);
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -1364,7 +1761,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        // experimental prefill streaming: seed the two slots with the first two layers
+        // and install the refill callback. the graph binds layer weights to the slots.
+        if (prefill_streaming_enabled && ubatch.n_tokens > 1) {
+            LLAMA_LOG_DEBUG("%s: prefill streaming ubatch of %d tokens, %zu refills so far\n",
+                    __func__, ubatch.n_tokens, prefill_streaming_n_fill);
+            prefill_streaming_fill_us    = 0;
+            prefill_streaming_fill_bytes = 0;
+            prefill_streaming_n_fill     = 0;
+            if (!prefill_streaming_fill_slot(0, 0, false) ||
+                (prefill_streaming_n_layer > 1 && !prefill_streaming_fill_slot(1, 1, false))) {
+                LLAMA_LOG_ERROR("%s: failed to seed prefill streaming slots\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                    prefill_streaming_sync_cb_trampoline, this);
+        }
+
         gf = model.build_graph(gparams);
+
+        // the callback may have failed while the graph was being built or run
+        if (prefill_streaming_failed) {
+            LLAMA_LOG_ERROR("%s: prefill streaming callback failed\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1379,6 +1802,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    if (prefill_streaming_enabled && ubatch.n_tokens > 1) {
+        LLAMA_LOG_INFO("%s: prefill streaming ubatch of %d tokens: %zu refills, %.2f MiB, %.3f ms total (%.2f GB/s)\n",
+                __func__, ubatch.n_tokens, prefill_streaming_n_fill,
+                prefill_streaming_fill_bytes/(1024.0*1024.0), prefill_streaming_fill_us/1000.0,
+                prefill_streaming_fill_us > 0 ? prefill_streaming_fill_bytes/(double)prefill_streaming_fill_us/1000.0 : 0.0);
+        prefill_streaming_check_placement(res->get_gf());
     }
 
     // set the input data for the input tensors
@@ -2470,6 +2901,8 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    const bool stream = prefill_streaming_enabled && ubatch.n_tokens > 1;
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2485,6 +2918,11 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
+        /*.tensor_bind =*/ stream
+            ? llm_graph_tensor_bind([this](ggml_context * ctx, ggml_tensor * tensor, int il) {
+                  return prefill_streaming_bind(ctx, tensor, il);
+              })
+            : llm_graph_tensor_bind(),
         /*.res         =*/ res,
     };
 }
@@ -3649,6 +4087,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.prefill_streaming          =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

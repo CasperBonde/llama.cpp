@@ -766,6 +766,9 @@ public:
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
+// experimental: redirect a layer weight tensor to a different tensor (e.g. a slot-backed view)
+using llm_graph_tensor_bind = std::function<ggml_tensor * (ggml_context * ctx, ggml_tensor * tensor, int il)>;
+
 class llm_graph_result;
 
 struct llm_graph_params {
@@ -806,6 +809,7 @@ struct llm_graph_params {
     uint32_t n_outputs;
 
     llm_graph_cb cb;
+    llm_graph_tensor_bind tensor_bind;
 
     llm_graph_result * res;
 
@@ -1029,6 +1033,7 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+    const llm_graph_tensor_bind & tensor_bind;
 
     llm_graph_result * res;
 

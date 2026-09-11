@@ -1884,6 +1884,19 @@ uint32_t llama_model::n_gpu_layers() const {
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
 }
 
+std::vector<const ggml_tensor *> llama_model::get_prefill_streaming_layer_tensors(int il) const {
+    const std::string prefix = "blk." + std::to_string(il) + ".";
+
+    std::vector<const ggml_tensor *> result;
+    for (const auto & [name, tensor] : tensors_by_name) {
+        if (name.rfind(prefix, 0) == 0) {
+            result.push_back(tensor);
+        }
+    }
+
+    return result;
+}
+
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }

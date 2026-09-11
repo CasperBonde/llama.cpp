@@ -78,23 +78,45 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // experimental prefill streaming: redirect this layer's weight tensors to the VRAM
+        // slot that currently holds them. only a copy is modified, the model is untouched.
+        llama_layer layer = model.layers[il];
+        if (tensor_bind) {
+            auto bind = [&](ggml_tensor * tensor) {
+                return tensor_bind(ctx0, tensor, il);
+            };
+
+            layer.attn_norm     = bind(layer.attn_norm);
+            layer.wq            = bind(layer.wq);
+            layer.wk            = bind(layer.wk);
+            layer.wv            = bind(layer.wv);
+            layer.wo            = bind(layer.wo);
+            layer.attn_q_norm   = bind(layer.attn_q_norm);
+            layer.attn_k_norm   = bind(layer.attn_k_norm);
+            layer.ffn_norm      = bind(layer.ffn_norm);
+            layer.ffn_gate_inp  = bind(layer.ffn_gate_inp);
+            layer.ffn_gate_exps = bind(layer.ffn_gate_exps);
+            layer.ffn_down_exps = bind(layer.ffn_down_exps);
+            layer.ffn_up_exps   = bind(layer.ffn_up_exps);
+        }
+
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
 
         // norm
         cur = build_norm(inpL,
-                model.layers[il].attn_norm, NULL,
+                layer.attn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         // self_attention
         {
             // compute Q and K and RoPE them
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+            Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
             Qcur = ggml_rope_ext(
@@ -103,7 +125,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
 
-            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+            Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_normed", il);
 
             Kcur = ggml_rope_ext(
@@ -117,7 +139,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    layer.wo, layer.wo_b, layer.wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -129,16 +151,16 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         // MoE branch
         cur = build_norm(ffn_inp,
-                model.layers[il].ffn_norm, NULL,
+                layer.ffn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
         ggml_tensor * moe_out =
             build_moe_ffn(cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
                     nullptr,
                     n_expert, n_expert_used,
                     LLM_FFN_SILU, true,
@@ -146,9 +168,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il,
                     nullptr, nullptr,
-                    model.layers[il].ffn_up_exps_s,
-                    model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    layer.ffn_up_exps_s,
+                    layer.ffn_gate_exps_s,
+                    layer.ffn_down_exps_s);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 
