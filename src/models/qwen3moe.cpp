@@ -78,27 +78,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
-        // experimental prefill streaming: redirect this layer's weight tensors to the VRAM
-        // slot that currently holds them. only a copy is modified, the model is untouched.
-        llama_layer layer = model.layers[il];
-        if (tensor_bind) {
-            auto bind = [&](ggml_tensor * tensor) {
-                return tensor_bind(ctx0, tensor, il);
-            };
-
-            layer.attn_norm     = bind(layer.attn_norm);
-            layer.wq            = bind(layer.wq);
-            layer.wk            = bind(layer.wk);
-            layer.wv            = bind(layer.wv);
-            layer.wo            = bind(layer.wo);
-            layer.attn_q_norm   = bind(layer.attn_q_norm);
-            layer.attn_k_norm   = bind(layer.attn_k_norm);
-            layer.ffn_norm      = bind(layer.ffn_norm);
-            layer.ffn_gate_inp  = bind(layer.ffn_gate_inp);
-            layer.ffn_gate_exps = bind(layer.ffn_gate_exps);
-            layer.ffn_down_exps = bind(layer.ffn_down_exps);
-            layer.ffn_up_exps   = bind(layer.ffn_up_exps);
-        }
+        const llama_layer & layer = model.layers[il];
 
         res->t_layer_inp[il] = inpL;
 

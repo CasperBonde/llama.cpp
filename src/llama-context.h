@@ -275,6 +275,10 @@ private:
     bool prefill_streaming_sync_cb(ggml_tensor * t, bool ask);
     static bool prefill_streaming_sync_cb_trampoline(ggml_tensor * t, bool ask, void * user_data);
 
+    // repoint every node that reads a streamed weight at the slot tensor holding it.
+    // this runs after the model has built the graph, so no model code has to know about streaming.
+    void prefill_streaming_rewrite_graph(ggml_cgraph * gf) const;
+
     // sanity check that the streamed layers are actually computed on the slot device
     void prefill_streaming_check_placement(ggml_cgraph * gf);
 

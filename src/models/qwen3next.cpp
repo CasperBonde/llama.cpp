@@ -150,44 +150,7 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
-        // experimental prefill streaming: redirect this layer's weight tensors to the VRAM
-        // slot that currently holds them. only a copy is modified, the model is untouched.
-        llama_layer layer = model.layers[il];
-        if (tensor_bind) {
-            auto bind = [&](ggml_tensor * tensor) {
-                return tensor_bind(ctx0, tensor, il);
-            };
-
-            layer.attn_norm        = bind(layer.attn_norm);
-            layer.attn_post_norm   = bind(layer.attn_post_norm);
-            layer.wq               = bind(layer.wq);
-            layer.wk               = bind(layer.wk);
-            layer.wv               = bind(layer.wv);
-            layer.wo               = bind(layer.wo);
-            layer.attn_q_norm      = bind(layer.attn_q_norm);
-            layer.attn_k_norm      = bind(layer.attn_k_norm);
-            layer.ssm_in           = bind(layer.ssm_in);
-            layer.wqkv             = bind(layer.wqkv);
-            layer.wqkv_gate        = bind(layer.wqkv_gate);
-            layer.ssm_conv1d       = bind(layer.ssm_conv1d);
-            layer.ssm_dt           = bind(layer.ssm_dt);
-            layer.ssm_a            = bind(layer.ssm_a);
-            layer.ssm_beta_alpha   = bind(layer.ssm_beta_alpha);
-            layer.ssm_norm         = bind(layer.ssm_norm);
-            layer.ssm_out          = bind(layer.ssm_out);
-            layer.ffn_gate_inp     = bind(layer.ffn_gate_inp);
-            layer.ffn_gate_exps    = bind(layer.ffn_gate_exps);
-            layer.ffn_down_exps    = bind(layer.ffn_down_exps);
-            layer.ffn_up_exps      = bind(layer.ffn_up_exps);
-            layer.ffn_gate_up_exps = bind(layer.ffn_gate_up_exps);
-            layer.ffn_gate_inp_shexp = bind(layer.ffn_gate_inp_shexp);
-            layer.ffn_gate_shexp   = bind(layer.ffn_gate_shexp);
-            layer.ffn_up_shexp     = bind(layer.ffn_up_shexp);
-            layer.ffn_down_shexp   = bind(layer.ffn_down_shexp);
-            layer.ffn_gate         = bind(layer.ffn_gate);
-            layer.ffn_up           = bind(layer.ffn_up);
-            layer.ffn_down         = bind(layer.ffn_down);
-        }
+        const llama_layer & layer = model.layers[il];
 
         res->t_layer_inp[il] = inpL;
 

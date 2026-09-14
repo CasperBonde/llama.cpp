@@ -376,8 +376,60 @@ ggml_tensor * llama_context::prefill_streaming_bind(ggml_context * ctx, ggml_ten
     return tensor;
 }
 
-// scheduler eval callback used to refill the slots.
+// repoint every node that reads a streamed weight at the slot tensor holding it.
 //
+// the model builds the graph with the real layer weights, so no model code has to know
+// about streaming. here we swap the weight operands for the slot-backed views, which is
+// what makes the scheduler place the op on the slot device.
+void llama_context::prefill_streaming_rewrite_graph(ggml_cgraph * gf) const {
+    if (gf == nullptr) {
+        return;
+    }
+
+    // source tensor -> slot tensor, built once from the per-layer mappings
+    static const bool debug = getenv("LLAMA_PREFILL_STREAMING_DEBUG") != nullptr;
+    int n_rewritten = 0;
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+
+            for (size_t il = 0; il < prefill_streaming_maps.size(); ++il) {
+                const auto & mapping = prefill_streaming_maps[il];
+                bool found = false;
+                for (size_t k = 0; k < mapping.size(); ++k) {
+                    if (mapping[k].first != src) {
+                        continue;
+                    }
+
+                    ggml_tensor * view = prefill_streaming_slots[il % 2].layers[il][k];
+                    if (debug && n_rewritten < 16) {
+                        LLAMA_LOG_INFO("%s: %s src[%d] %s -> %s (layer %zu)\n", __func__,
+                                node->name, j, ggml_get_name(src), ggml_get_name(view), il);
+                    }
+                    node->src[j] = view;
+                    n_rewritten++;
+                    found = true;
+                    break;
+                }
+                if (found) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (n_rewritten > 0) {
+        LLAMA_LOG_INFO("%s: rewrote %d graph operands to slot tensors\n", __func__, n_rewritten);
+    }
+}
+
+// scheduler eval callback used to refill the slots.//
 // returning true on the last node of layer il makes the scheduler compute that layer as
 // its own range and synchronize the backend afterwards. the following call with
 // ask == false is therefore the safe point to overwrite the other slot.
@@ -1192,12 +1244,11 @@ void llama_context::sched_reserve() {
     // experimental prefill streaming. opt-in via llama_context_params::prefill_streaming.
     // it needs host-resident weights to stream from, so it is only enabled when every
     // layer tensor lives in host memory.
-    if (cparams.prefill_streaming) {
-        if (prefill_streaming_init()) {
-            prefill_streaming_enabled = true;
-        } else {
-            LLAMA_LOG_WARN("%s: prefill streaming requested but unavailable, using the standard path\n", __func__);
-        }
+    //
+    // init already ran while the first reserve graph was built, so at this point the slots
+    // exist and the compute buffers below were sized against the slot-backed graph.
+    if (cparams.prefill_streaming && !prefill_streaming_enabled && !prefill_streaming_failed) {
+        LLAMA_LOG_WARN("%s: prefill streaming requested but unavailable, using the standard path\n", __func__);
     }
 }
 
@@ -1874,6 +1925,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf = model.build_graph(gparams);
+
+        // generic path: repoint the streamed weights at the slot tensors after the model
+        // built the graph, so no model code needs to be aware of prefill streaming
+        if (prefill_streaming_enabled && ubatch.n_tokens > 1 && gf != nullptr) {
+            prefill_streaming_rewrite_graph(gf);
+        }
 
         // the callback may have failed while the graph was being built or run
         if (prefill_streaming_failed) {
@@ -2965,11 +3022,35 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // prefill streaming has to be active while the reserve graph is built, so that the
+    // scheduler sizes the compute buffer knowing the layer weights come from a slot and
+    // not from a host buffer that it would have to stage into the compute buffer.
+    if (cparams.prefill_streaming && !prefill_streaming_enabled && !prefill_streaming_failed) {
+        if (prefill_streaming_init()) {
+            prefill_streaming_enabled = true;
+        } else {
+            prefill_streaming_failed = true;
+            LLAMA_LOG_WARN("%s: prefill streaming requested but unavailable, using the standard path\n", __func__);
+        }
+    }
+
+    // the reserve graph must bind the streamed weights too, otherwise the reserve does not
+    // reproduce the topology of the real graph and the compute buffer is sized for the wrong one
+    if (prefill_streaming_enabled) {
+        gparams.tensor_bind = llm_graph_tensor_bind([this](ggml_context * ctx, ggml_tensor * tensor, int il) {
+            return prefill_streaming_bind(ctx, tensor, il);
+        });
+    }
 
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    if (prefill_streaming_enabled && gf != nullptr) {
+        prefill_streaming_rewrite_graph(gf);
+    }
 
     this->n_outputs = save_n_outputs;
 
@@ -2994,8 +3075,6 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    const bool stream = prefill_streaming_enabled && ubatch.n_tokens > 1;
-
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -3011,11 +3090,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
-        /*.tensor_bind =*/ stream
-            ? llm_graph_tensor_bind([this](ggml_context * ctx, ggml_tensor * tensor, int il) {
-                  return prefill_streaming_bind(ctx, tensor, il);
-              })
-            : llm_graph_tensor_bind(),
+        /*.tensor_bind =*/ llm_graph_tensor_bind(),
         /*.res         =*/ res,
     };
 }
