@@ -155,6 +155,35 @@ Corrected, matching the sweep command exactly
 Confirmed four times on the current generic build: 84.07, 84.61, 84.83, 84.83.
 Correctness is unchanged, the code is far smaller.
 
+### 8d. The gain depends on the ubatch count, not on pp
+
+This was missing above and it is the single most important qualification.
+`-b 1024 -ub 1024` is ONE ubatch at pp1024 (win) but TWO ubatches at pp2048
+(loss), so the pp2048 row above is not evidence that long prompts regress.
+
+Re-measured on the current build, `-ngl 1 -ncmoe 99 -lm none -b == -ub == p -r 1`:
+
+    p      b=ub   ubatches   baseline   streaming   delta
+    512     512       1        38.09      64.55     +69.5%
+    1024   1024       1        54.31      87.01     +60.2%
+    1536   1536       1        64.85      97.80     +50.8%
+    2048   2048       1        71.83       --      FAIL (VRAM)
+    1536   1024      1.5       47.28      43.18      -8.7%
+    1024    512       2        37.95      33.50     -11.7%
+    1536    512       3        37.97      33.53     -11.7%
+    2048   1024       2        53.80      50.51      -6.1%
+    2048   1536      1.33      54.95      51.27      -6.7%
+    2048    512       4        53.85      50.37      -6.5%
+
+Exactly one ubatch per mmap batch: large win. More than one: small consistent
+loss. The slots are re-seeded synchronously at every ubatch start
+(`llama-context.cpp`), so the refill cost is paid per ubatch and only amortizes
+when there is a single ubatch. The baseline scheduler, by contrast, overlaps
+expert staging across ubatches with an async `cpy_tensor`.
+
+So the correct claim is `+50..70% for single-ubatch prefill`, which needs
+`-b >= p`. It is not a claim about prompt length.
+
 ## 8b. Correctness
 
     30B, -ngl 1, -b 256 -ub 256, --temp 0, prompt "The capital of France is"

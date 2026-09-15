@@ -1,0 +1,18 @@
+########## BASELINE ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -r 1 -ctk q4_0 -ctv q4_0 -fa 1
+load_tensors:        CUDA0 model buffer size =  1446.39 MiB
+load_tensors:    CUDA_Host model buffer size = 44806.92 MiB
+llama_kv_cache:      CUDA0 KV buffer size =     3.38 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   512.82 MiB
+sched_reserve:  CUDA_Host compute buffer size =     8.78 MiB
+~llama_context:      CUDA0 compute buffer size is 512.8165 MiB, matches expectation of 512.8165 MiB
+~llama_context:  CUDA_Host compute buffer size is   8.7793 MiB, matches expectation of   8.7793 MiB
+llama_kv_cache:      CUDA0 KV buffer size =     1.69 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   443.01 MiB
+sched_reserve:  CUDA_Host compute buffer size =     2.33 MiB
+~llama_context:      CUDA0 compute buffer size is 443.0055 MiB, matches expectation of 443.0055 MiB
+~llama_context:  CUDA_Host compute buffer size is   2.3316 MiB, matches expectation of   2.3316 MiB
+########## OPT1_ssm ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -r 1 -ctk q4_0 -ctv q4_0 -fa 1 -p 2048 -n 0 -ot blk\.[0-9]+\.ssm.*=CPU

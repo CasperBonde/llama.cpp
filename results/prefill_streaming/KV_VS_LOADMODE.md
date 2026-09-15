@@ -73,6 +73,33 @@ Command: `llama-bench -m 80B -ngl 1 -ncmoe 99 -lm none -n 0 -r 1 -b 1024 -ub 102
 (Those are the values in final_lmnone.txt. A second run of the same command gave
 37.89 / 63.42, 53.51 / 84.07, 53.95 / 49.51, i.e. within 0.5%.)
 
+QUALIFICATION, and it matters: the gain comes from the UBATCH COUNT, not from pp.
+With `-b 1024 -ub 1024` pp1024 is one ubatch (streaming wins, 87.01 measured on
+the current build) and pp2048 is two ubatches (streaming loses). The slots are
+re-seeded once per ubatch, so the refill cost is paid per ubatch and only amortizes
+when `-b >= p` gives a single ubatch. Measured on the current build, `-b == -ub`:
+pp512 38.09 -> 64.55 (+69.5%), pp1024 54.31 -> 87.01 (+60.2%),
+pp1536 64.85 -> 97.80 (+50.8%), pp2048 71.83 -> FAIL (VRAM).
+Multi-ubatch configs lose by 6-12% consistently. The honest claim is
+`+50..70% for single-ubatch prefill (-b >= p)`, not a claim about prompt length.
+
+### This is unreachable at the server config
+
+`-ngl 99 -ncmoe 48` leaves the experts as the ONLY host-resident `blk.*` tensors,
+so the slot builder picks the experts: slot = 996.00 MiB, 2 slots = 1992 MiB. That
+duplicates weights which also stay resident in `CUDA_Host` (44806.92 MiB), so
+enabling streaming raises VRAM instead of lowering it. Measured, `-p 512 -b 512
+-ub 512 -ps 1 -ngl 99 -ncmoe 48`:
+
+    model 1446.39 + KV 3.38 + RS 75.38 + slots 1992.00 = 3517.15, free = 198.85
+    graph_reserve needs 309.53 MiB for the compute buffer ->
+    ggml_backend_cuda_buffer_type_alloc_buffer: cudaMalloc failed: out of memory
+
+At the server's `-c 80000` the KV buffer alone is 528.19 MiB, so the budget for
+the compute buffer goes negative and the context cannot be created at all. The
+feature is currently not merely unhelpful at the server config, it is
+un-startable.
+
 Compare with the original sweep at the same cells (build 08b667fab):
 
     pp       baseline   streaming   gain

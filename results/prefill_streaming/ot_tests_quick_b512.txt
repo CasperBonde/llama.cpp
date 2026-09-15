@@ -1,0 +1,78 @@
+########## BASELINE ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -p 2048 -n 0 -r 1 -ctk q4_0 -ctv q4_0 -fa 1
+load_tensors:        CUDA0 model buffer size =  1446.39 MiB
+load_tensors:    CUDA_Host model buffer size = 44806.92 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    13.50 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   512.02 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |         38.33 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 512.0216 MiB, matches expectation of 512.0216 MiB
+~llama_context:  CUDA_Host compute buffer size is  10.2793 MiB, matches expectation of  10.2793 MiB
+########## OPT1_ssm ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -p 2048 -n 0 -r 1 -ctk q4_0 -ctv q4_0 -fa 1 -ot blk\.[0-9]+\.ssm.*=CPU
+load_tensors:        CUDA0 model buffer size =  1277.33 MiB
+load_tensors:    CUDA_Host model buffer size = 44975.98 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    13.50 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   512.02 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ssm.*=CPU |       none |          pp2048 |         38.27 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 512.0216 MiB, matches expectation of 512.0216 MiB
+~llama_context:  CUDA_Host compute buffer size is  10.2793 MiB, matches expectation of  10.2793 MiB
+########## OPT2_shexp ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -p 2048 -n 0 -r 1 -ctk q4_0 -ctv q4_0 -fa 1 -ot blk\.[0-9]+\.ffn_.*shexp.*=CPU
+load_tensors:        CUDA0 model buffer size =  1340.83 MiB
+load_tensors:    CUDA_Host model buffer size = 44912.48 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    13.50 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   514.30 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |          pp2048 |         38.21 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 514.2990 MiB, matches expectation of 514.2990 MiB
+~llama_context:  CUDA_Host compute buffer size is  10.2793 MiB, matches expectation of  10.2793 MiB
+########## OPT3_output ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -p 2048 -n 0 -r 1 -ctk q4_0 -ctv q4_0 -fa 1 -ot output\.weight=CPU
+load_tensors:        CUDA0 model buffer size =  1148.96 MiB
+load_tensors:    CUDA_Host model buffer size = 45104.35 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    13.50 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   592.20 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | output\.weight=CPU    |       none |          pp2048 |         38.30 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 592.1992 MiB, matches expectation of 592.1992 MiB
+~llama_context:  CUDA_Host compute buffer size is  10.2793 MiB, matches expectation of  10.2793 MiB
+########## OPT1+2_ssm_shexp ##########
+# args: -m models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf -ngl 99 -ncmoe 48 -lm none -b 512 -ub 512 -p 2048 -n 0 -r 1 -ctk q4_0 -ctv q4_0 -fa 1 -ot blk\.[0-9]+\.ssm.*=CPU -ot blk\.[0-9]+\.ffn_.*shexp.*=CPU
+load_tensors:        CUDA0 model buffer size =  1277.33 MiB
+load_tensors:    CUDA_Host model buffer size = 44975.98 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    13.50 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   512.02 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ssm.*=CPU |       none |          pp2048 |         38.27 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 512.0216 MiB, matches expectation of 512.0216 MiB
+~llama_context:  CUDA_Host compute buffer size is  10.2793 MiB, matches expectation of  10.2793 MiB
+load_tensors:        CUDA0 model buffer size =  1340.83 MiB
+load_tensors:    CUDA_Host model buffer size = 44912.48 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    13.50 MiB
+llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+sched_reserve:      CUDA0 compute buffer size =   514.30 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |          pp2048 |         38.72 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 514.2990 MiB, matches expectation of 514.2990 MiB
+~llama_context:  CUDA_Host compute buffer size is  10.2793 MiB, matches expectation of  10.2793 MiB
+########## OPT1+2_COMBINED (single comma -ot) ##########
+load_tensors:        CUDA0 model buffer size =  1277.33 MiB
+sched_reserve:      CUDA0 compute buffer size =   512.02 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ssm.*=CPU |       none |          pp2048 |         38.27 ± 0.00 |
+load_tensors:        CUDA0 model buffer size =  1340.83 MiB
+sched_reserve:      CUDA0 compute buffer size =   514.30 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |          pp2048 |         38.73 ± 0.00 |
+########## OPT1+2_COMBINED (semicolon, llama-bench syntax) ##########
+load_tensors:        CUDA0 model buffer size =  1171.77 MiB
+sched_reserve:      CUDA0 compute buffer size =   514.30 MiB
+sched_reserve:  CUDA_Host compute buffer size =    10.28 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |     512 |   q4_0 |   q4_0 |   1 | blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |          pp2048 |         38.20 ± 0.00 |

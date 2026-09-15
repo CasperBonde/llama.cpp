@@ -1,0 +1,32 @@
+##### p=2048 b=2048 ub=2048 ps=0 #####
+print_info: no_alloc              = 0
+sched_reserve:      CUDA0 compute buffer size =  1223.09 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     2048 |   q4_0 |   q4_0 |       none |          pp2048 |         71.77 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 1223.0859 MiB, matches expectation of 1223.0859 MiB
+##### p=2048 b=2048 ub=2048 ps=1 #####
+print_info: no_alloc              = 0
+sched_reserve:      CUDA0 compute buffer size =  1251.02 MiB
+CUDA error: the resource allocation failed
+/home/cbonde/dev/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:108: CUDA error
+##### p=2048 b=2048 ub=1536 ps=1 #####
+print_info: no_alloc              = 0
+sched_reserve:      CUDA0 compute buffer size =   938.27 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     1536 |   q4_0 |   q4_0 |       none |    1 |          pp2048 |         51.27 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 938.2715 MiB, matches expectation of 938.2715 MiB
+##### p=2048 b=2048 ub=1024 ps=1 #####
+print_info: no_alloc              = 0
+sched_reserve:      CUDA0 compute buffer size =   625.52 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp2048 |         50.37 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 625.5195 MiB, matches expectation of 625.5195 MiB
+##### p=2048 b=1024 ub=1024 ps=0 (BASELINE) #####
+sched_reserve:      CUDA0 compute buffer size =   611.58 MiB
+sched_reserve:  CUDA_Host compute buffer size =    44.38 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |          pp2048 |         53.85 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 611.5820 MiB, matches expectation of 611.5820 MiB
+~llama_context:  CUDA_Host compute buffer size is  44.3828 MiB, matches expectation of  44.3828 MiB
+##### p=2048 b=1536 ub=1536 ps=0 (BASELINE) #####
+sched_reserve:      CUDA0 compute buffer size =   917.37 MiB
+sched_reserve:  CUDA_Host compute buffer size =    66.39 MiB
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1536 |     1536 |   q4_0 |   q4_0 |       none |          pp2048 |         54.95 ± 0.00 |
+~llama_context:      CUDA0 compute buffer size is 917.3730 MiB, matches expectation of 917.3730 MiB
+~llama_context:  CUDA_Host compute buffer size is  66.3946 MiB, matches expectation of  66.3946 MiB
