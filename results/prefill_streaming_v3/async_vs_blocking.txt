@@ -1,0 +1,10 @@
+# async fill vs blocking fill, single ubatch (b == ub == p)
+# model: models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf
+# date: 2026-09-15T23:56:57+02:00
+# build: f4c71c721
+#
+# fill mode  p    t/s      seconds per prefill
+async      512  64.19    7.98
+blocking   512  62.53    8.19
+async      1024 84.42    12.13
+blocking   1024 81.45    12.57

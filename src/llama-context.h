@@ -376,6 +376,7 @@ private:
     int    prefill_streaming_n_layer = 0;
     int    prefill_streaming_cur_layer = -1; // layer currently computing, -1 if none
     size_t prefill_streaming_n_fill = 0;     // number of slot refills, for diagnostics
+    size_t prefill_streaming_n_split = 0;    // number of layer-boundary splits, for diagnostics
     int64_t prefill_streaming_fill_us = 0;   // time spent refilling slots, for diagnostics
     size_t prefill_streaming_fill_bytes = 0; // bytes copied into slots, for diagnostics
     std::vector<prefill_streaming_slot> prefill_streaming_slots;

@@ -1,0 +1,12 @@
+### p=512 ub=512 ps=0
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |       none |           pp512 |         38.15 ± 0.00 |
+### p=512 ub=512 ps=1
+process_ubatch: streaming ubatch of 512 tokens: compute 15353.320 ms, slot fill enqueue 176.523 ms, 48 refills
+process_ubatch: streaming ubatch of 512 tokens: compute 7946.991 ms, slot fill enqueue 177.948 ms, 94 refills
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |       none |    1 |           pp512 |         64.42 ± 0.00 |
+### p=768 ub=768 ps=0
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     768 |      768 |       none |           pp768 |         46.93 ± 0.00 |
+### p=768 ub=768 ps=1
+process_ubatch: streaming ubatch of 768 tokens: compute 17993.660 ms, slot fill enqueue 175.445 ms, 48 refills
+process_ubatch: streaming ubatch of 768 tokens: compute 9900.385 ms, slot fill enqueue 177.045 ms, 94 refills
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     768 |      768 |       none |    1 |           pp768 |         77.56 ± 0.00 |

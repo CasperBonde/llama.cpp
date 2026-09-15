@@ -1,0 +1,24 @@
+device: Quadro T1000, cc 7.5
+pcie link: gen 3 x16 (from nvidia-smi)
+pcie theoretical: 126.03 GB/s
+
+transfer                                           GB/s
+---------------------------------------------- --------
+
+-- pageable source (what llama.cpp uses today) --
+one block                                          9.58
+64 MiB chunks                                      9.73
+16 MiB chunks                                      9.56
+6 MiB chunks                                       9.16
+1 MiB chunks                                       6.65
+
+-- pinned source --
+one block                                         12.42
+64 MiB chunks                                     12.47
+16 MiB chunks                                     12.38
+6 MiB chunks                                      12.23
+1 MiB chunks                                      11.33
+
+-- mixed: H2D interleaved with D2H (mimics the MoE expert path) --
+pageable, 6 MiB chunks                             8.96
+pinned, 6 MiB chunks                              10.26

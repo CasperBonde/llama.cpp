@@ -1,0 +1,13 @@
+device: Quadro T1000, cc 7.5, 14 SMs, 3 copy engines
+
+-- separately --
+kernel alone                    37.63 ms
+copy alone (512 MiB, 8 chunks)    43.08 ms  (12.46 GB/s)
+
+-- overlapped (kernel on stream A, copy on stream B) --
+both together                   43.37 ms
+sum of the parts                80.72 ms
+max of the parts                43.08 ms
+
+=> the copy IS hidden. overlap works.
+   copy effective rate while overlapped: 12.38 GB/s

@@ -289,6 +289,14 @@ bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
         async = false;
     }
 
+    // LLAMA_PREFILL_STREAMING_NOCOPY: skip the copy entirely, to separate the cost of the
+    // copy itself from the cost of the per-refill work (seek, size math, driver calls).
+    // the slots keep whatever they held from the previous run, so the output is wrong.
+    static const bool no_copy = getenv("LLAMA_PREFILL_STREAMING_NOCOPY") != nullptr;
+    if (no_copy) {
+        return true;
+    }
+
     const int64_t t_fill_start = ggml_time_us();
     size_t fill_bytes = 0;
 
@@ -453,6 +461,7 @@ bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
         // the range that is about to be submitted ends at this node, so it is the range
         // that reads layer il's weights. make the compute stream wait for the prefetch.
         prefill_streaming_wait_slot(il % 2, il);
+        prefill_streaming_n_split++;
         return true;
     }
 
@@ -1913,6 +1922,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             prefill_streaming_fill_us    = 0;
             prefill_streaming_fill_bytes = 0;
             prefill_streaming_n_fill     = 0;
+            prefill_streaming_n_split    = 0;
             if (!prefill_streaming_fill_slot(0, 0, false) ||
                 (prefill_streaming_n_layer > 1 && !prefill_streaming_fill_slot(1, 1, false))) {
                 LLAMA_LOG_ERROR("%s: failed to seed prefill streaming slots\n", __func__);
@@ -1985,9 +1995,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // a batch behaves differently from the following ones.
     static const bool debug_streaming = getenv("LLAMA_PREFILL_STREAMING_DEBUG") != nullptr;
     if (debug_streaming && prefill_streaming_enabled) {
-        LLAMA_LOG_INFO("%s: streaming ubatch of %d tokens: compute %.3f ms, slot fill enqueue %.3f ms, %zu refills\n",
+        // how much copy work is still outstanding at the end of the ubatch? if the copy ran
+        // concurrently with compute this drains almost instantly, because the copies are spread
+        // over the whole ubatch. if it drains for about the full copy time, nothing overlapped.
+        int64_t t_drain_us = 0;
+        if (prefill_streaming_copy_backend) {
+            const int64_t t_drain_start = ggml_time_us();
+            ggml_backend_synchronize(prefill_streaming_copy_backend.get());
+            t_drain_us = ggml_time_us() - t_drain_start;
+        }
+        LLAMA_LOG_INFO("%s: streaming ubatch of %d tokens: compute %.3f ms, slot fill enqueue %.3f ms, %zu refills, %zu layer splits, copy drain at end %.3f ms\n",
                 __func__, ubatch.n_tokens, t_compute_us/1000.0,
-                prefill_streaming_fill_us/1000.0, prefill_streaming_n_fill);
+                prefill_streaming_fill_us/1000.0, prefill_streaming_n_fill, prefill_streaming_n_split,
+                t_drain_us/1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;
