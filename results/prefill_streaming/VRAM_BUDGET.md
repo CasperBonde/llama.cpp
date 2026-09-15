@@ -48,11 +48,33 @@ Per-layer sizes: experts 930.00, shared expert + router 6.20, GDN layer 20.20, a
 | 5 | reduce `-ub` 2048 -> 512 | 378.82 | prefill throughput, see sweep | measured |
 | 6 | `-ctk q8_0 -ctv q8_0` | none, it is worse | see section 4a | rejected |
 | 7 | raise `-ncmoe` to keep experts resident for generation | - | impossible, already 48/48 | n/a |
-| 8 | demote GDN/linear weights via `-ot` | **169.06** | 0.16% prefill | **measured, free** |
-| 9 | demote shared expert via `-ot` | **105.56** | 0.31% prefill | **measured, free** |
-| 10 | demote 8+9 together via `-ot` | **274.62** | 0.34% prefill | **measured, free** |
+| 8 | demote GDN/linear weights via `-ot` | **169.06** | +0.16% prefill, **-18.4% tg** | measured, NOT free |
+| 9 | demote shared expert via `-ot` | **105.56** | see section 9 | measured |
+| 10 | demote 8+9 together via `-ot` | **274.62** | +0.34% prefill, **-18.4% tg** | measured, NOT free |
 | 11 | demote `output.weight` via `-ot` | 217.25 net | +80.18 compute | measured, see below |
 | 12 | exclude experts from the streamed slot | **1150.14** | makes streaming start at all | see section 11 |
+
+### Correction: `-ot` is not free for generation
+
+Earlier versions of this table said the `-ot` saves were "free". That was measured on prefill
+only and is wrong for a server. Measured `-ngl 99 -ncmoe 48 -lm none -p 512 -n 128 -r 1`:
+
+| `-ot` | freed MiB | pp512 | tg128 | tg change |
+|---|---:|---:|---:|---:|
+| none | - | 38.70 | **18.51** | - |
+| `ssm` + `shexp` | 274.62 | 38.58 | **15.11** | **-18.4%** |
+| `(ssm\|attn_qkv\|attn_gate)` + `shexp` | 727.06 | 38.51 | **12.52** | **-32.4%** |
+
+Prefill really is unchanged, generation is not. The demoted weights are read every decode step
+instead of living on the GPU. So the correct recommendation for an interactive server is to
+leave `-ot` off unless the VRAM is needed to make the context fit at all.
+
+### The VRAM ceiling for this route
+
+`-ncmoe 48` is already all 48 layers, so all experts are on the CPU host buffer
+(`CUDA_Host model` 44806.92 MiB) and cannot move to VRAM. The only weights `-ot` can demote are
+the 1446.39 MiB of non-experts. So the ceiling for this whole approach is about 1.4 GB, not the
+9 GB one might hope for from "move the experts".
 
 ## 9. Measured -ot results
 

@@ -1,0 +1,9 @@
+##### ot='' #####
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |   q4_0 |   q4_0 |       none |           pp512 |         38.70 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |   q4_0 |   q4_0 |       none |           tg128 |         18.51 ± 0.00 |
+##### ot='blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU' #####
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |   q4_0 |   q4_0 | blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |           pp512 |         38.58 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |   q4_0 |   q4_0 | blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |           tg128 |         15.11 ± 0.00 |
+##### ot='blk\.[0-9]+\.(ssm|attn_qkv|attn_gate).*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU' #####
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |   q4_0 |   q4_0 | blk\.[0-9]+\.(ssm|attn_qkv|attn_gate).*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |           pp512 |         38.51 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |  99 |         48 |   q4_0 |   q4_0 | blk\.[0-9]+\.(ssm|attn_qkv|attn_gate).*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |           tg128 |         12.52 ± 0.00 |

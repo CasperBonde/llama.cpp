@@ -1,0 +1,6 @@
+##### ps=1 ot='' #####
+##### ps=0 ot='' #####
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     2048 |   q4_0 |   q4_0 |       none |          pp2048 |         71.79 ± 0.00 |
+##### ps=1 ot='blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU' #####
+##### ps=0 ot='blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU' #####
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     2048 |   q4_0 |   q4_0 | blk\.[0-9]+\.ssm.*=CPU;blk\.[0-9]+\.ffn_.*shexp.*=CPU |       none |          pp2048 |         71.83 ± 0.00 |
