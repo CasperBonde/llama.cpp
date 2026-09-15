@@ -1,0 +1,8 @@
+build          ps=0 p=1024  pp1024 |         54.32 ± 0.00
+build          ps=0 p=2048  pp2048 |         53.82 ± 0.00
+build          ps=1 p=1024  pp1024 |         86.68 ± 0.00
+build          ps=1 p=2048  pp2048 |         49.81 ± 0.00
+build-nograph  ps=0 p=1024  pp1024 |         53.58 ± 0.00
+build-nograph  ps=0 p=2048  pp2048 |         53.15 ± 0.00
+build-nograph  ps=1 p=1024  pp1024 |         86.73 ± 0.00
+build-nograph  ps=1 p=2048  pp2048 |         49.77 ± 0.00

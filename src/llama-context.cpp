@@ -1972,11 +1972,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_compute_start = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const int64_t t_compute_us = ggml_time_us() - t_compute_start;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // LLAMA_PREFILL_STREAMING_DEBUG: per-ubatch wall time, to see whether the first ubatch of
+    // a batch behaves differently from the following ones.
+    static const bool debug_streaming = getenv("LLAMA_PREFILL_STREAMING_DEBUG") != nullptr;
+    if (debug_streaming && prefill_streaming_enabled) {
+        LLAMA_LOG_INFO("%s: streaming ubatch of %d tokens: compute %.3f ms, slot fill enqueue %.3f ms, %zu refills\n",
+                __func__, ubatch.n_tokens, t_compute_us/1000.0,
+                prefill_streaming_fill_us/1000.0, prefill_streaming_n_fill);
     }
 
     ret = GGML_STATUS_SUCCESS;

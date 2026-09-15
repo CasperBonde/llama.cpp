@@ -1,0 +1,18 @@
+##### p=1024 #####
+process_ubatch: streaming ubatch of 1024 tokens: compute 11764.606 ms, slot fill enqueue 175.257 ms, 94 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20034.335 ms, slot fill enqueue 173.843 ms, 48 refills
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp1024 |         87.03 ± 0.00 |
+##### p=2048 #####
+process_ubatch: streaming ubatch of 1024 tokens: compute 20048.419 ms, slot fill enqueue 175.672 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20050.213 ms, slot fill enqueue 175.584 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20162.811 ms, slot fill enqueue 175.776 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20207.774 ms, slot fill enqueue 175.884 ms, 48 refills
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp2048 |         50.42 ± 0.00 |
+##### p=3072 #####
+process_ubatch: streaming ubatch of 1024 tokens: compute 19844.285 ms, slot fill enqueue 175.661 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 19998.476 ms, slot fill enqueue 175.430 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20035.240 ms, slot fill enqueue 175.366 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20113.061 ms, slot fill enqueue 173.521 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20582.291 ms, slot fill enqueue 175.135 ms, 48 refills
+process_ubatch: streaming ubatch of 1024 tokens: compute 20694.637 ms, slot fill enqueue 174.889 ms, 48 refills
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp3072 |         50.38 ± 0.00 |
