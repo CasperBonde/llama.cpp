@@ -388,7 +388,65 @@ None of them close it. The structural reason is that a slot is 996.00 MiB while 
 non-expert, non-token_embd weight set is 1446.39 MiB. Two slots are more than the whole rest of
 the model, so no amount of marginal trimming reaches 1992 MiB.
 
+## 13. The slot scales with the host weight set, not with the streamed part
+
+This is the finding that decides the design. Demoting the GDN weights via `-ot` at the server
+placement makes the slot slightly BIGGER, not smaller:
+
+| config | `-ot` | tensors in slot | slot (MiB) | CUDA0 model |
+|---|---|---:|---:|---:|
+| `-ngl 99 -ncmoe 48` | none | 144 | 996.00 | 1446.39 |
+| `-ngl 99 -ncmoe 48` | `ssm` | 360 | **1000.70** | 1277.33 |
+
+The slot grew by 4.70 MiB, exactly the `ssm` bytes, because `get_prefill_streaming_layer_tensors`
+collects every host-resident `blk.<il>.*` tensor. Demoting a weight into the slot-ready set
+therefore charges the slot for it as well as charging `CUDA_Host` for it. Both copies are live,
+so `-ot` and streaming are **zero-sum**:
+
+```
+-with -ot ssm:      model 1277.33 + KV 3.38 + RS 75.38 + slots 2001.40 = 3357.49
+-without -ot:       model 1446.39 + KV 3.38 + RS 75.38 + slots 1992.00 = 3517.15
+```
+
+Net VRAM saved: **none**. And in both cases `graph_reserve` then needs 309.53 MiB for the
+compute buffer and `cudaMalloc` fails.
+
+So the real defect is not the slot size. It is that the slot holds the same weights as
+`CUDA_Host`. That is the expert case too, where the duplication is 1992 MiB.
+
+### The duplication-free design
+
+A slot only pays off if the weights it holds are live ONLY in the slot. That means:
+
+1. `prefill_streaming_init` must exclude the experts from the slot, otherwise the slot
+   duplicates the 996.00 MiB expert block.
+2. The non-expert weights must be assigned exclusively to the slot buffer instead of ending up
+   in both `CUDA0` and the slot. Streaming the same tensor from two buffers is not a saving.
+
+Neither is true today, which is why every measured configuration is worse than the baseline.
+
+### What I got wrong
+
+I earlier computed a 1150.14 MiB saving for "exclude experts from the slot". That figure is
+still correct for the slot itself, but it comes with a second change I did not check: the
+non-expert weights have to move out of `CUDA0` at the same time. `-ot` alone does not do that,
+it makes the duplication worse. The 1150.14 is therefore a conditional number, not a win that
+`-ot` delivers.
+
+### One remaining unknown
+
+The `cudaMalloc` failure happens in `graph_reserve`, after `prefill_streaming_init` has already
+allocated the 2 slots. That ordering is what makes the failure unconditional: at the server
+config the model plus two expert-sized slots can never leave room for compute. With
+expert-excluded slots (52.82 MiB) this resolves, because then the model, KV, RS and slots
+together come to well under half of VRAM. That arithmetic has not been measured yet, because it
+needs the code change.
+
 ## 8. Open questions
 
 1. Does `-ub 256/384/512` beat `-ub 2048` on prefill throughput? Sweep interrupted, not concluded.
 2. Is the slot worth reworking to sub-layer granularity? Design change, needs agreement.
+3. Does excluding experts from the slot, and giving the non-expert weights a single home,
+   make the feature fit? Needs the code change to measure.
+4. `-ps` is a bare toggle in the CLI and server but takes `<0|1>` in llama-bench. Pre-existing
+   inconsistency, not yet aligned.
