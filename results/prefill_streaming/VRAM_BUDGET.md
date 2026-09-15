@@ -410,6 +410,62 @@ None of them close it. The structural reason is that a slot is 996.00 MiB while 
 non-expert, non-token_embd weight set is 1446.39 MiB. Two slots are more than the whole rest of
 the model, so no amount of marginal trimming reaches 1992 MiB.
 
+## 14. The refill is per ubatch, not per token
+
+This supersedes section 12 as the explanation for the ubatch-count dependence. Every ubatch
+refills all 48 layers, regardless of how many tokens it holds:
+
+```
+2-token  ubatch: 48 refills, 45842.96 MiB
+9-token  ubatch: 48 refills
+512-token ubatch: 48 refills, 45842.96 MiB
+```
+
+45.86 GiB per ubatch at every size. For one big ubatch the transfer is 1.00x the streamed
+weights, which is optimal. For many small ubatches it is a multiple of that:
+
+| ub | ubatches per 4096 tokens | transfer | tokens/s from a 12.34 GB/s copy budget |
+|---:|---:|---:|---:|
+| 2048 | 2 | 2.00x | 551 |
+| 2048 (p=2048) | 1 | 1.00x | 551 |
+| 512 | 8 | 8.00x | 138 |
+| 256 | 16 | 16.00x | 69 |
+
+So the copy budget bounds the achievable rate whenever the copy cannot fully hide behind
+compute. For a large ubatch, compute per ubatch is long enough that 1022.41 MiB hides. For a
+small ubatch, compute is short and the copy becomes visible: `-ub 512` measures 26.13 t/s where
+the copy budget alone would allow 138, so it is already partly hidden, but the multi-ubatch
+amortization is the part that never recovers.
+
+### Measured: one ubatch is much faster than four at the same total prompt
+
+| p | b=ub | ubatches | transfer | baseline | streaming |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 2048 | 1 | 45.86 GiB | 71.83 | FAIL (VRAM) |
+| 2048 | 512 | 4 | 183.4 GiB | 53.85 | 50.37 |
+| 1536 | 1536 | 1 | 45.86 GiB | 64.85 | **97.80** |
+
+The baseline also degrades with more ubatches (71.83 -> 53.85), so only part of the gap is
+streaming-specific. But the streaming peak of 97.80 only exists at one ubatch, and the one
+ubatch case at p=2048 cannot be measured because it runs out of VRAM.
+
+### Confirmed on a chat prompt, and it is much worse than the benchmark suggests
+
+`llama-cli -c 2048 -b 512 -ub 512`, 7-token prompt, `-ngl 1 -ncmoe 99`:
+
+| mode | prompt rate | output |
+|---|---:|---|
+| default | **22.1 t/s** | "The capital of France is Paris." |
+| `--prefill-streaming` | **1.6 t/s** | "The capital of France is Paris." |
+
+Correctness is fine, the text is identical. But the prompt rate drops 13.8x, because streaming
+moves a fixed 45.86 GiB per ubatch no matter how many tokens the ubatch holds. A chat prompt
+with only a handful of new tokens is the worst case: the copy is charged in full for a
+negligible amount of compute.
+
+For a server this is the decisive result. Agent and chat workloads send small numbers of new
+tokens per request, so `--prefill-streaming` would make them slower, not faster.
+
 ## 13. The slot scales with the host weight set, not with the streamed part
 
 This is the finding that decides the design. Demoting the GDN weights via `-ot` at the server
