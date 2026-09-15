@@ -1,0 +1,16 @@
+device: Quadro T1000, 14 SMs, 3 copy engines
+
+-- separately --
+kernel alone (256 MiB x 48 reps)     126.82 ms  (94.6 GiB/s device)
+copy alone   (512 MiB H2D)            43.43 ms  (12.36 GB/s)
+
+-- overlapped (kernel on stream A, H2D copy on stream B) --
+kernel finished at                   115.08 ms
+copy finished at                      43.36 ms
+total                                115.08 ms
+sum if serialized                    170.25 ms
+max if fully overlapped              126.82 ms
+copy rate while overlapped              12.38 GB/s
+
+=> overlap WORKS even against a memory bound kernel.
+   the serialization is in the llama.cpp submission/event pattern.

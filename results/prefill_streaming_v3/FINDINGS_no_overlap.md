@@ -48,7 +48,23 @@ stream B.
 | sum if serialized | 80.72 ms |
 
 Overlapped is `max(kernel, copy)`, so the copy is fully hidden, and the copy still runs at
-12.38 GB/s while the kernel runs. **The hardware and driver overlap correctly.**
+12.38 GB/s while the kernel runs.
+
+That kernel is ALU only, which is not representative of a prefill GEMM, so the test was
+repeated with `overlap_mem_bench.cu` against a kernel that saturates device memory
+bandwidth. The copy engine and the SMs contend for the same memory subsystem there, which
+is the honest comparison for a real GEMM.
+
+| | |
+|---|---:|
+| kernel alone (256 MiB x 48 reps, 94.6 GiB/s device) | 126.82 ms |
+| copy alone (512 MiB H2D) | 43.43 ms (12.36 GB/s) |
+| **both, overlapped** | **115.08 ms** (kernel 115.08, copy 43.36) |
+| sum if serialized | 170.25 ms |
+
+The copy is still fully hidden, and it still holds 12.38 GB/s while the device memory bus is
+saturated. **The hardware and driver overlap correctly, including under memory contention.
+Bandwidth contention is not the cause.**
 
 ---
 
@@ -119,7 +135,7 @@ actually running at the same time, even though section 2 shows that they can.
 | Copy is slow because the source is pageable | **ruled out.** Source is `CUDA_Host`, `cudaMallocHost`, 12.4 GB/s. |
 | Copy is slow because it is done in small chunks | **ruled out.** 1 MiB chunks still reach 11.33 GB/s. |
 | Copy is slow because the slot layout is many small tensors | **weakened.** Per-tensor calls cost about 2% (12.4 vs 12.2 GB/s between 1 block and 6 MiB chunks). Not the 3.9 s. |
-| The GPU cannot overlap compute and copy | **ruled out.** Section 2: 80.72 ms serial becomes 43.37 ms overlapped. |
+| The GPU cannot overlap compute and copy | **ruled out.** Section 2: 80.72 ms serial becomes 43.37 ms overlapped, and 170.25 ms serial becomes 115.08 ms against a memory bound kernel. |
 | The layer splits / barriers are the cost | **ruled out.** Section 3: 8511 ms with all 48 splits and barriers. |
 | CUDA graphs | **ruled out earlier.** Same result with `GGML_CUDA_GRAPHS=OFF`. |
 | Slot duplication on later ubatches | **ruled out.** Copy bytes identical per ubatch. |
@@ -159,8 +175,9 @@ The most likely place to look next, in order:
 ## 8. Reproduce
 
 ```
-results/prefill_streaming_v3/copy_bench.cu      # link limit
-results/prefill_streaming_v3/overlap_bench.cu   # kernel vs copy overlap
+results/prefill_streaming_v3/copy_bench.cu         # link limit, pageable vs pinned
+results/prefill_streaming_v3/overlap_bench.cu      # kernel vs copy overlap
+results/prefill_streaming_v3/overlap_mem_bench.cu  # memory bound kernel vs copy overlap
 
 LLAMA_PREFILL_STREAMING_DEBUG=1  ./build/bin/llama-bench -v -m <model> -ngl 1 -ncmoe 99 \
     -lm none -p 1024 -b 1024 -ub 1024 -ps 1 -r 1
