@@ -1,0 +1,5 @@
+##### SYNC-FILL p=1024 #####
+process_ubatch: prefill streaming ubatch of 1024 tokens: 48 refills, 45842.96 MiB, 3893.683 ms total (12.35 GB/s)
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp1024 |         83.49 ± 0.00 |
+##### SYNC-FILL p=2048 #####
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp2048 |         49.28 ± 0.00 |

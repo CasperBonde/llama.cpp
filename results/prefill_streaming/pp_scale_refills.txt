@@ -1,0 +1,58 @@
+##### p=1024 #####
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens, 0 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 173.579 ms total (12.35 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens: 48 refills, 45842.96 MiB, 175.031 ms total (274.64 GB/s)
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp1024 |         86.64 ± 0.00 |
+##### p=2048 #####
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens, 0 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 173.323 ms total (12.37 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 173.917 ms total (12.33 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 174.676 ms total (12.28 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 172.968 ms total (12.40 GB/s)
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp2048 |         50.48 ± 0.00 |
+##### p=3072 #####
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens, 0 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 173.368 ms total (12.37 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 173.643 ms total (12.35 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 172.425 ms total (12.44 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 174.512 ms total (12.29 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 174.383 ms total (12.30 GB/s)
+process_ubatch: prefill streaming ubatch of 1024 tokens, 48 refills so far
+prefill_streaming_rewrite_graph: rewrote 840 graph operands to slot tensors
+process_ubatch: prefill streaming ubatch of 1024 tokens: 2 refills, 2044.82 MiB, 172.500 ms total (12.43 GB/s)
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |   q4_0 |   q4_0 |       none |    1 |          pp3072 |         50.37 ± 0.00 |
