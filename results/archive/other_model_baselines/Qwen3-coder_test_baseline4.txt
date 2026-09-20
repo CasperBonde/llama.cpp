@@ -1,0 +1,31 @@
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch |         lm |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | ---------: | --------------: | -------------------: |
+[New LWP 30105]
+[New LWP 30104]
+[New LWP 30100]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007e3fe6110913 in __GI___wait4 (pid=30109, stat_loc=0x0, options=0, usage=0x0) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#0  0x00007e3fe6110913 in __GI___wait4 (pid=30109, stat_loc=0x0, options=0, usage=0x0) at ../sysdeps/unix/sysv/linux/wait4.c:30
+30	in ../sysdeps/unix/sysv/linux/wait4.c
+#1  0x00007e3fe6319853 in ggml_print_backtrace () from /home/cbonde/dev/llama.cpp/build/bin/libggml-base.so.0
+#2  0x00007e3fe63199fb in ggml_abort () from /home/cbonde/dev/llama.cpp/build/bin/libggml-base.so.0
+#3  0x00007e3fdb061f57 in ggml_cuda_error(char const*, char const*, char const*, int, char const*) () from /home/cbonde/dev/llama.cpp/build/bin/libggml-cuda.so.0
+#4  0x00007e3fdb077d22 in ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) () from /home/cbonde/dev/llama.cpp/build/bin/libggml-cuda.so.0
+#5  0x00007e3fe6338cb7 in ggml_backend_sched_graph_compute_async () from /home/cbonde/dev/llama.cpp/build/bin/libggml-base.so.0
+#6  0x00007e3fe5706fc1 in llama_context::graph_compute(ggml_cgraph*, bool) () from /home/cbonde/dev/llama.cpp/build/bin/libllama.so.0
+#7  0x00007e3fe570a95a in llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) () from /home/cbonde/dev/llama.cpp/build/bin/libllama.so.0
+#8  0x00007e3fe571251d in llama_context::decode(llama_batch const&) () from /home/cbonde/dev/llama.cpp/build/bin/libllama.so.0
+#9  0x00007e3fe57139af in llama_decode () from /home/cbonde/dev/llama.cpp/build/bin/libllama.so.0
+#10 0x00007e3fe66ce181 in test_prompt(llama_context*, int, int, int) () from /home/cbonde/dev/llama.cpp/build/bin/libllama-bench-impl.so
+#11 0x00007e3fe66dd809 in llama_bench(int, char**) () from /home/cbonde/dev/llama.cpp/build/bin/libllama-bench-impl.so
+#12 0x00007e3fe602a1ca in __libc_start_call_main (main=main@entry=0x568bac560270 <main>, argc=argc@entry=17, argv=argv@entry=0x7ffebcaf6e08) at ../sysdeps/nptl/libc_start_call_main.h:58
+#13 0x00007e3fe602a28b in __libc_start_main_impl (main=0x568bac560270 <main>, argc=17, argv=0x7ffebcaf6e08, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffebcaf6df8) at ../csu/libc-start.c:360
+#14 0x0000568bac5602a5 in _start ()
+[Inferior 1 (process 30095) detached]

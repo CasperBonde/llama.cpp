@@ -1,0 +1,7 @@
+device Quadro T1000, 14 SMs
+source memory for the copy:
+
+pinned  (cudaHostAlloc)      kernel   19.87  copy   43.47  both   43.39  sum   63.34  max   43.47  OVERLAP
+pageable (posix_memalign)    kernel   19.50  copy   56.49  both   55.67  sum   75.99  max   56.49  OVERLAP
+pinned  (cudaHostAlloc)      kernel   19.56  copy   43.36  both   43.47  sum   62.92  max   43.36  OVERLAP
+pageable (posix_memalign)    kernel   19.55  copy   53.90  both   54.30  sum   73.46  max   53.90  OVERLAP

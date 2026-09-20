@@ -1,0 +1,84 @@
+# Prefill streaming vs baseline - micro-batch (ub) sweep
+# date    : 2026-09-11T13:53:22+02:00
+# model   : models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+# flags   : -ngl 99 -ncmoe 99 -lm none -n 0 -r 1 -o md
+# note    : baseline (pfs=0) vs streaming (pfs=1), b == p in every row
+
+## pp512 (b=512)
+
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch | n_ubatch |         lm |  pfs |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | -------: | ---------: | ---: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |       16 |       none |    0 |           pp512 |         45.76 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |       32 |       none |    0 |           pp512 |         22.98 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |       64 |       none |    0 |           pp512 |         23.78 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |      128 |       none |    0 |           pp512 |         24.86 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |      256 |       none |    0 |           pp512 |         39.19 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |      512 |       none |    0 |           pp512 |         58.83 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |       16 |       none |    1 |           pp512 |         11.64 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |       32 |       none |    1 |           pp512 |         22.99 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |       64 |       none |    1 |           pp512 |         33.19 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |      128 |       none |    1 |           pp512 |         29.65 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |      256 |       none |    1 |           pp512 |         45.54 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |     512 |      512 |       none |    1 |           pp512 |         71.66 ± 0.00 |
+
+build: 7e4b09727 (10829)
+
+## pp4096 (b=4096)
+
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch | n_ubatch |         lm |  pfs |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | -------: | ---------: | ---: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |       16 |       none |    0 |          pp4096 |         35.93 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |       32 |       none |    0 |          pp4096 |         22.43 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |       64 |       none |    0 |          pp4096 |         23.45 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |      128 |       none |    0 |          pp4096 |         23.53 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |      256 |       none |    0 |          pp4096 |         36.36 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |      512 |       none |    0 |          pp4096 |         53.39 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |       16 |       none |    1 |          pp4096 |         11.70 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |       32 |       none |    1 |          pp4096 |         23.01 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |       64 |       none |    1 |          pp4096 |         32.68 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |      128 |       none |    1 |          pp4096 |         28.77 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |      256 |       none |    1 |          pp4096 |         41.26 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |  99 |         99 |    4096 |      512 |       none |    1 |          pp4096 |         58.47 ± 0.00 |
+
+build: 7e4b09727 (10829)
+
+## Side-by-side comparison
+
+`old` rows were measured *without* an explicit `-b`, so they used the llama-bench
+defaults `-b 2048 -ub 512`. The `b == p` runs below use the requested batch size.
+
+### pp512
+
+| source | b | ub | ubatches | baseline (pfs=0) | streaming (pfs=1) | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| **old results** | 2048* | 512* | 1 | 59.68 | 70.82 | +18.7% |
+| sweep | 512 |  16 | 32 | 45.76 | 11.64 | -74.6% |
+| sweep | 512 |  32 | 16 | 22.98 | 22.99 | + 0.0% |
+| sweep | 512 |  64 |  8 | 23.78 | 33.19 | +39.6% |
+| sweep | 512 | 128 |  4 | 24.86 | 29.65 | +19.3% |
+| sweep | 512 | 256 |  2 | 39.19 | 45.54 | +16.2% |
+| sweep | 512 | 512 |  1 | 58.83 | 71.66 | +21.8% |
+
+### pp4096
+
+| source | b | ub | ubatches | baseline (pfs=0) | streaming (pfs=1) | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| **old results** | 2048* | 512* | 8 | 52.92 | 58.46 | +10.5% |
+| sweep | 4096 |  16 | 256 | 35.93 | 11.70 | -67.4% |
+| sweep | 4096 |  32 | 128 | 22.43 | 23.01 | + 2.6% |
+| sweep | 4096 |  64 |  64 | 23.45 | 32.68 | +39.4% |
+| sweep | 4096 | 128 |  32 | 23.53 | 28.77 | +22.3% |
+| sweep | 4096 | 256 |  16 | 36.36 | 41.26 | +13.5% |
+| sweep | 4096 | 512 |   8 | 53.39 | 58.47 | + 9.5% |
+
+`*` = llama-bench default, not passed explicitly
+
+prompt	baseline	streaming	gain
+ pp512	59.68	70.82	+18.7%
+pp1024	58.61	65.84	+12.3%
+pp2048	57.55	64.23	+11.6%
+pp4096	52.92	58.46	+10.5%

@@ -1,0 +1,57 @@
+## pp512 (b=512)
+
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch | n_ubatch |         lm |  pfs |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | -------: | ---------: | ---: | --------------: | -------------------: |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |       64 |       none |    0 |           pp512 |         18.87 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |      128 |       none |    0 |           pp512 |         17.62 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |      256 |       none |    0 |           pp512 |         24.93 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |      512 |       none |    0 |           pp512 |         37.68 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |     1024 |       none |    0 |           pp512 |         37.77 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |       64 |       none |    1 |           pp512 |         14.44 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |      128 |       none |    1 |           pp512 |         12.89 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |      256 |       none |    1 |           pp512 |         21.21 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |      512 |       none |    1 |           pp512 |         64.67 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     512 |     1024 |       none |    1 |           pp512 |         64.67 ± 0.00 |
+
+build: 08b667fab (10830)
+
+## pp1024 (b=1024)
+
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch | n_ubatch |         lm |  pfs |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | -------: | ---------: | ---: | --------------: | -------------------: |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |       64 |       none |    0 |          pp1024 |         18.88 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |      128 |       none |    0 |          pp1024 |         17.67 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |      256 |       none |    0 |          pp1024 |         25.54 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |      512 |       none |    0 |          pp1024 |         38.54 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |       none |    0 |          pp1024 |         52.70 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |       64 |       none |    1 |          pp1024 |         14.49 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |      128 |       none |    1 |          pp1024 |         25.01 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |      256 |       none |    1 |          pp1024 |         21.22 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |      512 |       none |    1 |          pp1024 |         33.75 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |    1024 |     1024 |       none |    1 |          pp1024 |         86.99 ± 0.00 |
+
+build: 08b667fab (10830)
+
+## pp2048 (b=2048)
+
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_ubatch |         lm |  pfs |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | -------: | ---------: | ---: | --------------: | -------------------: |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |       64 |       none |    0 |          pp2048 |         18.55 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |      128 |       none |    0 |          pp2048 |         17.55 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |      256 |       none |    0 |          pp2048 |         26.23 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |      512 |       none |    0 |          pp2048 |         38.09 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     1024 |       none |    0 |          pp2048 |         54.05 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |       64 |       none |    1 |          pp2048 |         14.38 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |      128 |       none |    1 |          pp2048 |         24.94 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |      256 |       none |    1 |          pp2048 |         21.07 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |      512 |       none |    1 |          pp2048 |         33.37 ± 0.00 |
+| qwen3next 80B.A3B Q4_K - Medium |  45.17 GiB |    79.67 B | CUDA       |   1 |         99 |     1024 |       none |    1 |          pp2048 |         49.85 ± 0.00 |
+
+build: 08b667fab (10830)
+

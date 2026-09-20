@@ -1,0 +1,10 @@
+device Quadro T1000, 14 SMs, asyncEngineCount 3
+compiled with per-thread default stream: no, cudaStreamPerThread is the legacy stream
+
+A kernel(nonblock) + copy(nonblock)  1 thread        kernel   19.66  copy   43.49  both   43.64  sum   63.15  max   43.49  OVERLAP
+B kernel(nonblock) + copy(perThread) 1 thread        kernel   19.49  copy   43.64  both   43.42  sum   63.13  max   43.64  OVERLAP
+C kernel(nonblock) + copy(blocking)  1 thread        kernel   19.55  copy   43.53  both   43.49  sum   63.08  max   43.53  OVERLAP
+D kernel(nonblock) + copy(stream 0)  1 thread        kernel   19.56  copy   43.58  both   43.57  sum   63.14  max   43.58  OVERLAP
+E kernel(nonblock) + copy(perThread) 2 threads       kernel   19.56  copy   43.39  both   22.06  sum   62.95  max   43.39  OVERLAP
+F kernel(nonblock) + copy(nonblock)  2 threads       kernel   22.02  copy   43.49  both   43.46  sum   65.51  max   43.49  OVERLAP
+G kernel(nonblock) + copy(stream 0)  2 threads       kernel   19.55  copy   43.40  both   43.49  sum   62.95  max   43.40  OVERLAP

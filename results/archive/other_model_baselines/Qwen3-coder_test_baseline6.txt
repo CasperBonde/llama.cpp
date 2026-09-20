@@ -1,0 +1,20 @@
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch | n_ubatch |         lm |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | -------: | ---------: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     768 |      384 |       none |          pp4096 |         43.63 ± 0.49 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     768 |      512 |       none |          pp4096 |         44.50 ± 0.48 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     768 |      768 |       none |          pp4096 |         59.98 ± 0.11 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     768 |     1024 |       none |          pp4096 |         60.12 ± 0.11 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     512 |      384 |       none |          pp4096 |         36.32 ± 0.50 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     512 |      512 |       none |          pp4096 |         52.53 ± 0.06 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     512 |      768 |       none |          pp4096 |         52.39 ± 0.40 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |     512 |     1024 |       none |          pp4096 |         52.18 ± 0.14 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    1024 |      384 |       none |          pp4096 |         42.75 ± 0.25 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    1024 |      512 |       none |          pp4096 |         52.61 ± 0.07 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    1024 |      768 |       none |          pp4096 |         52.82 ± 0.03 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    1024 |     1024 |       none |          pp4096 |         71.43 ± 0.07 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    2048 |      384 |       none |          pp4096 |         42.44 ± 0.14 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    2048 |      512 |       none |          pp4096 |         52.43 ± 0.17 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    2048 |      768 |       none |          pp4096 |         59.86 ± 0.21 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    2048 |     1024 |       none |          pp4096 |         71.33 ± 0.48 |
+
+build: 3ad1ba733 (10828)

@@ -1,0 +1,8 @@
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_batch | n_ubatch |         lm |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | -------: | ---------: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    2048 |     2048 |       none |          pp4096 |         87.07 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    2048 |     4096 |       none |          pp4096 |         87.15 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    4096 |     2048 |       none |          pp4096 |         87.08 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CUDA       |   0 |         40 |    4096 |     4096 |       none |          pp4096 |         98.18 ± 0.00 |
+
+build: 3ad1ba733 (10828)

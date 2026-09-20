@@ -1,0 +1,3 @@
+  baseline   The capital of France is Paris.
+  stream 1   The capital of France is Paris.
+  stream 2   The capital of France is Paris.

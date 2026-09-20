@@ -1,0 +1,1433 @@
+diff --git a/DoubleBuffer_Prefill_Designv3.md b/DoubleBuffer_Prefill_Designv3.md
+new file mode 100644
+index 000000000..73551063c
+--- /dev/null
++++ b/DoubleBuffer_Prefill_Designv3.md
+@@ -0,0 +1,426 @@
++# Design Notes: Prefill Double Buffering in llama.cpp
++
++## 1. Goal
++
++Validate whether a large MoE prefill can keep only two complete transformer layers in VRAM and overlap transfer of the next layer with computation of the current layer.
++
++The target experiment is a CUDA decoder-only MoE model, using a large prefill ubatch, normally capped at 4096 tokens. Each slot contains every weight needed by one layer, including all MoE experts, shared experts, biases, and scale tensors used by that layer.
++
++The desired steady state is:
++
++```text
++Host RAM:     full model weights
++VRAM slot 0:  layer il       <-> compute
++VRAM slot 1:  layer il + 1   <-> transfer
++
++then alternate the slots
++```
++
++Generation remains on the existing execution path. It is acceptable for generation to keep experts on CPU or otherwise use the normal scheduler. This work validates prefill first.
++
++## 2. Important API and Architecture Corrections
++
++The supplied design notes identify the right two implementation directions, but several details must match this checkout.
++
++### 2.1 Custom operations
++
++The public API is `ggml_map_custom1` or `ggml_map_custom1_inplace`, not `ggml_custom1`:
++
++```c
++struct ggml_tensor * ggml_map_custom1(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        ggml_custom1_op_t     fun,
++        int                   n_tasks,
++        void                * userdata);
++```
++
++The callback signature is:
++
++```c
++void callback(
++    struct ggml_tensor * dst,
++    const struct ggml_tensor * src,
++    int ith,
++    int nth,
++    void * userdata);
++```
++
++`MAP_CUSTOM1` is implemented by the CPU backend in the current source. It is not a CUDA kernel that can be inserted into a CUDA stream and is not automatically a general host callback from a CUDA graph. If the scheduler places this operation on CPU, the existing scheduler dependency/copy machinery must be allowed to synchronize the relevant data before the callback runs.
++
++Therefore a custom operation is useful for a correctness probe, but it is not the final overlap mechanism. The callback must also be safe when called with multiple tasks. Use `n_tasks = 1` for a synchronization probe, and ensure the callback is not invoked more than once per graph execution.
++
++### 2.2 Backend events and asynchronous uploads
++
++This checkout exposes:
++
++- `ggml_backend_graph_compute_async`
++- `ggml_backend_tensor_set_async`
++- `ggml_backend_tensor_copy_async`
++- `ggml_backend_event_new`
++- `ggml_backend_event_record`
++- `ggml_backend_event_synchronize`
++- `ggml_backend_event_wait`
++
++CUDA implements backend event record and wait with CUDA events and stream waits. The model loader already uses asynchronous tensor upload plus events for staging-buffer reuse. This existing infrastructure is the preferred foundation for the overlap prototype.
++
++The event API is backend-level, not a promise that every backend supports the same concurrent copy/compute behavior. The prototype must check the selected device and fall back when async upload or event ordering is unavailable.
++
++## 3. Core Design: Static Graph Weight Slots
++
++The central idea is valid only if the graph contains stable tensor objects whose storage points to fixed slot addresses:
++
++```text
++layer 0 weight tensor -> slot 0 storage
++layer 1 weight tensor -> slot 1 storage
++layer 2 weight tensor -> slot 0 storage
++layer 3 weight tensor -> slot 1 storage
++```
++
++The graph may therefore be built with alternating slot-backed tensors. At runtime, the host overwrites a slot with the next layer only after the GPU has finished all operations that read the previous contents.
++
++This is different from changing `ggml_tensor::data` while a graph is executing. Tensor metadata and backend allocation must remain stable for the lifetime of submitted work. The implementation must never mutate active tensor pointers or reuse a slot before its compute-complete event.
++
++The graph can be built up front only if the layer graphs are separate or if the graph has explicit synchronization nodes between layer regions. A full graph with alternating pointers does not by itself make host overwrites safe: the host still needs a precise ordering point before each slot is reused.
++
++## 4. Two Validation Approaches
++
++### Approach 1: CPU synchronization probe with `ggml_map_custom1`
++
++This is the smallest way to validate the overwrite protocol and tensor binding without first adding a new backend abstraction.
++
++At the end of each supported layer region, insert a CPU custom node that has the current activation as its input. The dependency ensures the node is after the layer's output. The callback can:
++
++1. Notify a transfer worker that the previous slot is no longer needed.
++2. Wait until the worker has finished preparing the next slot.
++3. Return the activation unchanged.
++
++Conceptually:
++
++```text
++layer N compute
++    |
++CPU MAP_CUSTOM1 synchronization node
++    |
++layer N + 1 compute
++```
++
++The callback should carry a small synchronization object in `userdata`, containing the layer index, slot index, condition variable, and failure state. Do not use global mutable state. Use one task for the callback.
++
++#### What this proves
++
++- The layer tensors can be represented by fixed slot-backed objects.
++- The host can overwrite a slot only after the prior layer has completed.
++- The complete MoE layer can be transferred without changing graph tensor shapes or kernel contracts.
++- The graph produces correct logits and KV-cache state.
++
++#### What this does not prove
++
++- CUDA compute and host-to-device transfer overlap.
++- That the custom node can execute inside a CUDA graph capture.
++- That the scheduler will place the custom node and its copies with the desired dependencies on every backend.
++- That a CPU callback has acceptable latency.
++
++A custom-node prototype should disable CUDA graph capture and use a normal scheduler path. It should log the backend assigned to the custom node. If the scheduler cannot produce a correct CPU split, stop using this approach and move to explicit graph chunking.
++
++The callback may introduce a pipeline bubble because CPU execution can require synchronization with preceding GPU work. That is acceptable for this validation stage.
++
++### Approach 2: Layer graphs with backend events
++
++This is the production-shaped design and the only approach that should be used to measure true transfer/compute overlap.
++
++Build one graph per transformer layer, or one reusable layer graph whose bound weight tensors alternate between two fixed slots. The CPU orchestrates transfers and graph submission while the backend streams enforce ordering:
++
++```text
++transfer layer 0 -> slot 0
++record upload_done[0]
++
++compute layer 0 waits for upload_done[0]
++transfer layer 1 -> slot 1 while layer 0 computes
++record upload_done[1]
++
++compute layer 1 waits for upload_done[1]
++transfer layer 2 waits for compute_done[0], then writes slot 0
++```
++
++The important ordering is:
++
++```text
++upload(layer il, slot s)
++    -> upload_done[s]
++    -> compute(il) waits on upload_done[s]
++    -> compute_done[s]
++    -> next upload using slot s waits on compute_done[s]
++```
++
++The CPU should not call `ggml_backend_event_synchronize` in the steady-state path except during teardown, error handling, or a required staging-buffer reuse. GPU-side `ggml_backend_event_wait` should establish the dependency on the compute backend.
++
++## 5. Recommended Implementation Sequence
++
++### Stage 0: Instrument the existing path
++
++Measure before changing execution:
++
++- Per-layer tensor byte sizes, including all MoE experts.
++- Largest layer and required slot size.
++- Existing model host and device buffer sizes.
++- Per-layer compute time for 1024, 2048, and 4096 tokens.
++- Existing model-load upload behavior and whether the selected CUDA buffer type supports async upload.
++- Free VRAM before and after model load.
++
++This validates the memory assumption and establishes whether layer compute is long enough to hide transfer.
++
++### Stage 1: Static slot and synchronous copy proof
++
++Use one supported CUDA architecture and one slot first.
++
++1. Keep a canonical host copy of all model tensors.
++2. Allocate one device buffer large enough for the largest supported layer.
++3. Create slot-backed tensor views with the original type, shape, strides, quantization layout, and alignment.
++4. Copy one complete layer into the slot synchronously.
++5. Build and execute one layer graph.
++6. Pass its activation and memory context to the next layer.
++7. Compare logits and subsequent generation with normal execution.
++
++This stage intentionally avoids custom callbacks, a second slot, and asynchronous copies. It establishes that graph decomposition and binding are correct.
++
++### Stage 2: Custom-node synchronization probe
++
++If the static binding works, add `ggml_map_custom1` only as a development probe for the slot handoff.
++
++The probe may use two slots and a background transfer thread, but it should initially use synchronous or explicitly completed transfers. Its purpose is to demonstrate that the graph reaches a safe per-layer handoff and that the next layer observes the new slot contents.
++
++Do not treat this stage as a benchmark. Disable CUDA graph capture, keep the callback single-task, and retain a normal-path fallback.
++
++### Stage 3: Two-slot asynchronous overlap
++
++Replace the CPU callback protocol with explicit layer-graph submission and backend events:
++
++1. Allocate slot 0 and slot 1 from the selected CUDA device buffer type.
++2. Build a layer manifest describing every tensor's slot offset and byte size.
++3. Create upload-complete and compute-complete events for both slots.
++4. Start upload of layer 0 into slot 0.
++5. Record `upload_done[0]` on completion of that upload stream.
++6. Submit layer 0 with `ggml_backend_event_wait(compute_backend, upload_done[0])`.
++7. Start upload of layer 1 into slot 1.
++8. Before reusing slot 0 for layer 2, make its upload stream wait for `compute_done[0]`.
++9. Continue alternating slots.
++
++The exact upload backend may be the existing model upload backend or a dedicated backend context, but it must be a backend-supported stream. Do not call CUDA stream APIs directly from llama.cpp.
++
++## 6. Layer Graph and Activation Ownership
++
++The current full graph is built through `llama_model::build_graph` and architecture-specific graph builders. It is not safe to insert host-side slot reuse merely because the source code has a loop over layers.
++
++The layer execution unit must include the complete transformer layer:
++
++- Attention projections and attention.
++- KV-cache writes for that layer.
++- Routing and all selected MoE operations.
++- Every expert tensor needed by the MoE operation.
++- Residual and normalization operations.
++
++The output activation becomes the input to the next layer graph. It must remain in normal backend compute memory and must not alias a slot that is being overwritten.
++
++The layer graph builder should accept:
++
++- Layer index.
++- Current activation.
++- Existing ubatch and position inputs.
++- Existing memory context.
++- An explicit bound-layer tensor view.
++- A final-layer/output flag.
++
++The first architecture should be implemented by factoring or adapting its existing layer loop. Do not refactor every architecture before the first result.
++
++The final output norm, output projection, pooling, and sampling must be handled as a separate final stage where the architecture requires it.
++
++## 7. Layer Slot Representation
++
++Do not initially create a universal packed format. Create an internal manifest for one architecture that records:
++
++- Layer index.
++- Tensor identity and name.
++- Host source tensor or source address.
++- Slot offset.
++- Tensor byte size.
++- Tensor type, dimensions, and strides.
++- Alignment and backend buffer type.
++
++Slot size is the maximum layer allocation rounded using the actual backend buffer alignment. Do not assume 256-byte alignment without querying the buffer/backend contract.
++
++A slot-backed tensor must preserve the original quantized representation. This is especially important for `GGML_OP_MUL_MAT_ID`, which expects a particular expert tensor layout. If a tensor cannot be represented as a valid view, disable the prototype for that architecture rather than silently repacking it.
++
++Do not mutate canonical `llama_layer` pointers globally. Use an explicit layer view or binding passed to the selected graph builder. This keeps the normal full-graph path and fallback path independent.
++
++## 8. Host-to-Device Transfer
++
++The model loader demonstrates an existing pattern for asynchronous upload:
++
++```text
++read or obtain host data
++wait before reusing a staging buffer
++set tensor asynchronously
++record an event
++reuse the staging buffer only after its event completes
++```
++
++Reuse that infrastructure where possible. The transfer source must be valid for the selected async API. Mmap-backed data may need pinned staging memory; do not assume every mmap mapping can be registered directly.
++
++For the first async prototype:
++
++- Use a bounded number of pinned staging buffers.
++- Record an upload event after each slot upload.
++- Wait for that event before reusing the staging buffer.
++- Report synchronous-copy fallback clearly.
++- Keep host memory lifetime longer than all pending uploads.
++
++If asynchronous host upload is unavailable, retain the synchronous validation path and do not claim overlap.
++
++## 9. Scheduler and Backend Boundaries
++
++The custom-node proof may use the existing scheduler, but the true overlap path should avoid hiding cross-stream work inside a full scheduler submission.
++
++A suitable boundary is:
++
++```text
++llama.cpp layer executor:
++    chooses layer and slot
++    builds or reuses layer graph
++    submits upload and compute dependencies
++    owns activation handoff
++
++backend API:
++    owns streams, events, copies, and synchronization
++```
++
++Stage 1 may call the existing scheduler once per layer. Stage 3 may require a small backend-neutral helper around event and async-copy operations, but it should reuse the existing `ggml_backend_*` APIs first. Do not add CUDA types to `llama_context`.
++
++Every backend capability must be checked. CUDA is the only target for this experiment; all other backends use the normal path.
++
++## 10. MoE Behavior
++
++The complete layer transfer includes:
++
++- Gate/router weights.
++- All expert up, gate, and down weights.
++- Expert biases and scale tensors.
++- Shared expert tensors.
++- Any architecture-specific latent or fused expert tensors.
++
++The graph continues to perform normal routing and top-k selection. There is no host-side expert-selection barrier in the current graph model. The synchronization boundary is after the complete layer graph, not after routing.
++
++For a 4096-token prefill, whole-layer transfer is a reasonable first hypothesis because many experts may be active. The benchmark must still measure transfer size and compute time rather than assume all experts are equally useful.
++
++## 11. Correctness Tests
++
++Compare normal and streamed execution using the same model, prompt, context parameters, and seed:
++
++- Prompt logits for all requested outputs.
++- First generated token.
++- Several later generated tokens.
++- Continued generation after streamed KV-cache writes.
++- Prompt sizes below and above the threshold.
++- 1024, 2048, and 4096-token cases where supported.
++- Quantized MoE tensors and per-expert scales.
++- Single sequence first; multiple sequences later.
++- Context reuse only after the basic path works.
++
++Classify mismatches as binding/layout, activation handoff, KV-cache ordering, final-stage handling, or normal backend nondeterminism.
++
++## 12. Performance Measurements
++
++The custom-node path is a correctness probe and may be slower because the CPU callback can force a synchronization bubble.
++
++For the event path, report:
++
++- End-to-end prefill tokens per second.
++- Layer upload time.
++- Layer compute time.
++- Upload/compute overlap.
++- Slot reuse stalls.
++- Graph build and scheduler allocation time.
++- Peak VRAM.
++- Host memory bandwidth.
++- Generation speed after streamed prefill.
++
++The event path is worthwhile only if it reduces end-to-end prefill time and reduces model-weight VRAM residency. Overlap measured only at the copy API is insufficient if graph construction dominates.
++
++## 13. Failure and Fallback Rules
++
++Use the existing full-graph path when:
++
++- The backend is not the supported CUDA device.
++- The model architecture is not explicitly supported.
++- A layer does not fit in the slot budget.
++- A tensor has incompatible layout, alignment, or buffer type.
++- Async upload or events are unavailable.
++- A custom-node or layer-graph allocation fails.
++- An unsupported memory, adapter, recurrent, encoder, hybrid, or cross-attention path is active.
++- The request is generation-sized or below the configured prefill threshold.
++
++Fallback must happen before modifying active model tensor ownership. A failed experiment must not leave the normal model path pointing at a temporary slot.
++
++## 14. Acceptance Criteria
++
++The first validation is successful when:
++
++1. One supported CUDA MoE architecture runs prefill with static slot-backed weights.
++2. The custom-node probe, if used, completes without slot corruption.
++3. Streamed logits match normal execution within expected tolerance.
++4. Generation after streamed prefill remains correct.
++5. The normal path remains unchanged for unsupported cases.
++6. The event-based two-slot version demonstrates measurable copy/compute overlap.
++7. End-to-end prefill improves enough to justify the additional synchronization code.
++
++The contribution boundary should be:
++
++```text
++first change: static layer binding and correctness proof
++next change:  custom-node synchronization probe if useful
++main feature: two-slot layer graphs with backend events
++later work:   broader architectures, backends, generation caching, and multi-GPU support
++```
++
++## 14. Implementation Hand-off and Review Status
++
++### Completed
++
++- Added the opt-in `prefill_streaming` context flag.
++- Added `llama-bench` support for `--prefill` and `--prefill-streaming`.
++- Added `DBPREFILL:` diagnostics and timing reports.
++- Added model layer-size reporting.
++- Added a two-slot allocation and layer packing prototype.
++- Added Qwen3-MoE and DeepSeek2 tensor-binding scaffolding.
++- Added direct host-pointer slot writes where source tensors are host-backed.
++- Added one reusable staging buffer for non-host source tensors.
++- Disabled full-graph slot binding and automatic slot filling after review found that they were unsafe before graph chunking.
++
++### Critical review result
++
++The earlier full-graph slot experiment was invalid. It filled slot 0 with layers 0, 2, 4, ... and slot 1 with layers 1, 3, 5, ... before submitting one graph. The graph then referenced the same slot for multiple distinct layers. Earlier layers therefore observed overwritten data. Its reported throughput must not be used as a correctness or performance result.
++
++Two slots are allocated once per context. The old fill loop did not allocate or clear the slots per layer, but it did allocate a temporary `std::vector<uint8_t>` for every tensor and perform a backend read followed by a backend write. That path is now disabled until layer execution is chunked.
++
++### Valid baseline
++
++Using the Qwen3-Coder 30B-A3B model with `-ngl 0`, `-ub 2048`, `-p 1024`, `-n 0`, and `-lm none`:
++
++```text
++-ncmoe 40: 77.72 t/s
++-ncmoe 48: 78.34 t/s
++```
++
++The difference is within normal run-to-run noise for this single-repetition measurement. `-ncmoe N` places expert tensors for layers `0` through `N - 1` on CPU; it is not an expert-count setting. For this 48-layer model, `-ncmoe 48` is the complete expert-on-CPU configuration.
++
++### Next required implementation
++
++The actual feature still requires a layer executor. The next change must:
++
++1. Build a graph for one transformer layer only.
++2. Execute that graph before reusing its slot.
++3. Carry the resulting activation and KV-cache state into the next layer graph.
++4. Fill only the slot needed for the next layer.
++5. Add upload and compute events after synchronous correctness works.
++
++The existing full-graph binding callback should not be re-enabled. A first implementation should target Qwen3-MoE only, use a host activation bridge if necessary for correctness, and compare its logits against the normal scheduler before optimizing the bridge or adding asynchronous overlap.
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 015196ca1..3b600f016 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1681,6 +1681,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.n_ubatch = value;
+         }
+     ).set_env("LLAMA_ARG_UBATCH"));
++    add_opt(common_arg(
++        {"--prefill-streaming"},
++        "request CUDA layer-streamed prefill (experimental; falls back when unsupported)",
++        [](common_params & params) {
++            params.prefill_streaming = true;
++        }
++    ).set_env("LLAMA_ARG_PREFILL_STREAMING"));
+     add_opt(common_arg(
+         {"--keep"}, "N",
+         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
+diff --git a/common/common.cpp b/common/common.cpp
+index d162a3880..90634a9d8 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1746,6 +1746,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.offload_kqv       = !params.no_kv_offload;
+     cparams.no_perf           = params.no_perf;
+     cparams.op_offload        = !params.no_op_offload;
++    cparams.prefill_streaming = params.prefill_streaming;
+     cparams.swa_full          = params.swa_full;
+     cparams.kv_unified        = params.kv_unified;
+ 
+diff --git a/common/common.h b/common/common.h
+index 63d0badd0..b4f507692 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -456,6 +456,7 @@ struct common_params {
+     int32_t n_sequences           =     1; // number of sequences to decode
+     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
++    bool prefill_streaming = false;
+     int32_t grp_attn_n            =     1; // group-attention factor
+     int32_t grp_attn_w            =   512; // group-attention width
+     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
+diff --git a/include/llama.h b/include/llama.h
+index ef7a012c4..605f65389 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -407,6 +407,9 @@ extern "C" {
+                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+ 
++        // [EXPERIMENTAL] request CUDA layer-streamed prefill when supported
++        bool prefill_streaming;
++
+         // [EXPERIMENTAL]
+         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
+         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c1ef12f56..d72b6b16d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -38,6 +38,156 @@ struct llm_fused_op_probe {
+     uint32_t n_tokens_per_seq;
+ };
+ 
++static void dbprefill_sync_callback(
++        ggml_tensor * dst,
++        const ggml_tensor * src,
++        int ith,
++        int nth,
++        void * userdata) {
++    GGML_UNUSED(dst);
++    GGML_UNUSED(src);
++    GGML_UNUSED(nth);
++
++    if (ith == 0) {
++        const auto * probe = static_cast<const dbprefill_sync_probe_state *>(userdata);
++        LLAMA_LOG_INFO("DBPREFILL: custom_sync_probe reached tokens=%u boundary=graph_end\n",
++                probe->n_tokens);
++    }
++}
++
++bool llama_context::init_prefill_streaming_slots() {
++    if (dbprefill_slots.size() == 2) {
++        return true;
++    }
++
++    ggml_backend_t backend = nullptr;
++    for (const auto & candidate : backends) {
++        auto * device = ggml_backend_get_device(candidate.get());
++        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            backend = candidate.get();
++            break;
++        }
++    }
++
++    if (!backend) {
++        LLAMA_LOG_INFO("DBPREFILL: slot_fill disabled reason=no_gpu_backend\n");
++        return false;
++    }
++
++    const int64_t start_us = ggml_time_us();
++    const auto buft = ggml_backend_get_default_buffer_type(backend);
++    const size_t alignment = ggml_backend_buft_get_alignment(buft);
++    size_t largest_layer = 0;
++    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
++        size_t layer_size = 0;
++        for (const auto * tensor : model.get_prefill_streaming_layer_tensors(il)) {
++            layer_size = (layer_size + alignment - 1) / alignment * alignment;
++            layer_size += ggml_nbytes(tensor);
++        }
++        largest_layer = std::max(largest_layer, layer_size);
++    }
++    largest_layer = (largest_layer + alignment - 1) / alignment * alignment;
++
++    dbprefill_slots.resize(2);
++    dbprefill_layer_offsets.resize(model.hparams.n_layer_all);
++    for (int slot = 0; slot < 2; ++slot) {
++        ggml_init_params params = {
++            /*.mem_size   =*/ ggml_tensor_overhead(),
++            /*.mem_buffer =*/ nullptr,
++            /*.no_alloc   =*/ true,
++        };
++        dbprefill_slots[slot].ctx.reset(ggml_init(params));
++        dbprefill_slots[slot].tensor = dbprefill_slots[slot].ctx
++            ? ggml_new_tensor_1d(dbprefill_slots[slot].ctx.get(), GGML_TYPE_I8, largest_layer)
++            : nullptr;
++        dbprefill_slots[slot].buffer.reset(dbprefill_slots[slot].ctx && dbprefill_slots[slot].tensor
++            ? ggml_backend_alloc_ctx_tensors(dbprefill_slots[slot].ctx.get(), backend)
++            : nullptr);
++        if (!dbprefill_slots[slot].ctx || !dbprefill_slots[slot].tensor || !dbprefill_slots[slot].buffer) {
++            dbprefill_slots.clear();
++            LLAMA_LOG_INFO("DBPREFILL: slot_fill disabled reason=slot_initialization_failed\n");
++            return false;
++        }
++        ggml_backend_buffer_set_usage(dbprefill_slots[slot].buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        dbprefill_slots[slot].size = largest_layer;
++    }
++
++    LLAMA_LOG_INFO("DBPREFILL: slots allocated count=2 bytes_each=%zu alignment=%zu\n", largest_layer, alignment);
++    dbprefill_timing_data.slot_init_us += ggml_time_us() - start_us;
++    return true;
++}
++
++bool llama_context::fill_prefill_streaming_slot(int slot, int il) {
++    if (slot < 0 || slot >= (int) dbprefill_slots.size()) {
++        return false;
++    }
++
++    auto & dst = dbprefill_slots[slot];
++    const auto tensors = model.get_prefill_streaming_layer_tensors(il);
++    const size_t alignment = ggml_backend_buffer_get_alignment(dst.buffer.get());
++    const int64_t fill_start_us = ggml_time_us();
++    size_t offset = 0;
++    for (const auto * source : tensors) {
++        const size_t size = ggml_nbytes(source);
++        offset = (offset + alignment - 1) / alignment * alignment;
++        if (offset + size > dst.size) {
++            return false;
++        }
++        const void * source_data = source->data;
++        if (!ggml_backend_buffer_is_host(source->buffer)) {
++            const int64_t alloc_start_us = ggml_time_us();
++            if (dbprefill_staging.size() < size) {
++                dbprefill_staging.resize(size);
++            }
++            dbprefill_timing_data.temporary_alloc_us += ggml_time_us() - alloc_start_us;
++            const int64_t read_start_us = ggml_time_us();
++            ggml_backend_tensor_get(source, dbprefill_staging.data(), 0, size);
++            dbprefill_timing_data.source_read_us += ggml_time_us() - read_start_us;
++            source_data = dbprefill_staging.data();
++        }
++        const int64_t write_start_us = ggml_time_us();
++        ggml_backend_tensor_set(dst.tensor, source_data, offset, size);
++        dbprefill_timing_data.slot_write_us += ggml_time_us() - write_start_us;
++        if (dbprefill_layer_offsets[il].size() < tensors.size()) {
++            dbprefill_layer_offsets[il].push_back({ source, offset });
++        }
++        offset += size;
++    }
++
++    LLAMA_LOG_INFO("DBPREFILL: slot_fill layer=%d slot=%d tensors=%zu bytes=%zu capacity=%zu\n",
++            il, slot, tensors.size(), offset, dst.size);
++    dbprefill_timing_data.slot_fill_us += ggml_time_us() - fill_start_us;
++    dbprefill_timing_data.n_layers_filled++;
++    return true;
++}
++
++ggml_tensor * llama_context::bind_prefill_streaming_tensor(ggml_context * ctx, ggml_tensor * tensor, int il) const {
++    if (!dbprefill_slots_filled || il < 0 || il >= (int) dbprefill_layer_offsets.size()) {
++        return tensor;
++    }
++
++    size_t offset = SIZE_MAX;
++    for (const auto & entry : dbprefill_layer_offsets[il]) {
++        if (entry.first == tensor) {
++            offset = entry.second;
++            break;
++        }
++    }
++    if (offset == SIZE_MAX) {
++        return tensor;
++    }
++
++    auto & slot = dbprefill_slots[il % 2];
++    ggml_tensor * view = ggml_view_1d(ctx, slot.tensor, ggml_nbytes(tensor), offset);
++    view->type = tensor->type;
++    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++        view->ne[i] = tensor->ne[i];
++        view->nb[i] = tensor->nb[i];
++    }
++    ggml_set_name(view, ggml_get_name(tensor));
++    return view;
++}
++
+ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
+     /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
+     /*.name             =*/ "Flash Attention",
+@@ -271,6 +421,7 @@ llama_context::llama_context(
+ 
+     cparams.op_offload = params.op_offload;
+     cparams.kv_unified = params.kv_unified;
++    cparams.prefill_streaming = params.prefill_streaming;
+ 
+     // initialized later
+     cparams.pipeline_parallel = false;
+@@ -311,6 +462,11 @@ llama_context::llama_context(
+     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
+     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
++        LLAMA_LOG_INFO("%s: prefill_streaming     = %s\n", __func__,
++            cparams.prefill_streaming ? "requested" : "disabled");
++    if (cparams.prefill_streaming) {
++        LLAMA_LOG_WARN("%s: prefill streaming is not available yet; using the standard graph scheduler\n", __func__);
++    }
+     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
+     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
+     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+@@ -482,6 +638,17 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    if (cparams.prefill_streaming && dbprefill_timing_data.context_start_us != 0) {
++        const auto & t = dbprefill_timing_data;
++        LLAMA_LOG_INFO("DBPREFILL: timing_report context_ms=%.3f slot_init_ms=%.3f slot_fill_ms=%.3f source_read_ms=%.3f temp_alloc_ms=%.3f slot_write_ms=%.3f graph_build_ms=%.3f graph_alloc_ms=%.3f input_set_ms=%.3f graph_compute_ms=%.3f layers=%d\n",
++                (ggml_time_us() - t.context_start_us) / 1000.0,
++                t.slot_init_us / 1000.0, t.slot_fill_us / 1000.0,
++                t.source_read_us / 1000.0, t.temporary_alloc_us / 1000.0,
++                t.slot_write_us / 1000.0, t.graph_build_us / 1000.0,
++                t.graph_alloc_us / 1000.0, t.input_set_us / 1000.0,
++                t.graph_compute_us / 1000.0, t.n_layers_filled);
++    }
++
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -1332,12 +1499,40 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    if (cparams.prefill_streaming && dbprefill_timing_data.context_start_us == 0) {
++        dbprefill_timing_data.context_start_us = ggml_time_us();
++    }
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+         return nullptr;
+     }
+ 
++    if (cparams.prefill_streaming) {
++        model.log_prefill_streaming_diagnostics(ubatch.n_tokens);
++        dbprefill_probe.n_tokens = ubatch.n_tokens;
++
++        if (!dbprefill_eval_logged) {
++            for (const auto & backend : backends) {
++                auto * device = ggml_backend_get_device(backend.get());
++                ggml_backend_dev_props props;
++                ggml_backend_dev_get_props(device, &props);
++                LLAMA_LOG_INFO("DBPREFILL: device=%s type=%d async=%s events=%s free_mib=%.2f total_mib=%.2f\n",
++                        ggml_backend_dev_name(device), props.type,
++                        props.caps.async ? "yes" : "no",
++                        props.caps.events ? "yes" : "no",
++                        props.memory_free / 1024.0 / 1024.0,
++                        props.memory_total / 1024.0 / 1024.0);
++            }
++            dbprefill_eval_logged = true;
++        }
++
++        if (ubatch.n_tokens >= 1024 && !dbprefill_slots_filled) {
++            LLAMA_LOG_INFO("DBPREFILL: slot_fill disabled reason=full_graph_not_layer_chunked\n");
++        }
++    }
++
+     auto * res = gf_res_prev.get();
+     auto * gf  = res->get_gf();
+ 
+@@ -1364,7 +1559,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
++        const int64_t graph_build_start_us = cparams.prefill_streaming ? ggml_time_us() : 0;
+         gf = model.build_graph(gparams);
++        if (cparams.prefill_streaming) {
++            dbprefill_timing_data.graph_build_us += ggml_time_us() - graph_build_start_us;
++        }
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+@@ -1374,11 +1573,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        if (cparams.prefill_streaming && ubatch.n_tokens >= 1024 && ggml_graph_n_nodes(gf) > 0) {
++            ggml_tensor * sync = ggml_map_custom1(
++                res->get_ctx(), ggml_graph_node(gf, -1),
++                    dbprefill_sync_callback, 1, &dbprefill_probe);
++            ggml_build_forward_expand(gf, sync);
++            LLAMA_LOG_INFO("DBPREFILL: custom_sync_probe enabled nodes=%d\n", ggml_graph_n_nodes(gf));
++        }
++
++        const int64_t graph_alloc_start_us = cparams.prefill_streaming ? ggml_time_us() : 0;
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
++        if (cparams.prefill_streaming) {
++            dbprefill_timing_data.graph_alloc_us += ggml_time_us() - graph_alloc_start_us;
++        }
+     }
+ 
+     // set the input data for the input tensors
+@@ -1386,12 +1597,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //const auto t_start_us = ggml_time_us();
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
++        const int64_t input_set_start_us = cparams.prefill_streaming ? ggml_time_us() : 0;
+         res->set_inputs(&ubatch);
++        if (cparams.prefill_streaming) {
++            dbprefill_timing_data.input_set_us += ggml_time_us() - input_set_start_us;
++        }
+ 
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
++    const int64_t dbprefill_compute_start = cparams.prefill_streaming ? ggml_time_us() : 0;
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (cparams.prefill_streaming) {
++        dbprefill_timing_data.graph_compute_us += ggml_time_us() - dbprefill_compute_start;
++        LLAMA_LOG_INFO("DBPREFILL: graph_eval tokens=%u nodes=%d elapsed_ms=%.3f\n",
++                ubatch.n_tokens, ggml_graph_n_nodes(res->get_gf()),
++                (ggml_time_us() - dbprefill_compute_start) / 1000.0);
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+@@ -2485,6 +2707,7 @@ llm_graph_params llama_context::graph_params(
+         /*.samplers    =*/ sampling.samplers,
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
++        /*.tensor_bind =*/ llm_graph_tensor_bind(),
+         /*.res         =*/ res,
+     };
+ }
+@@ -3649,6 +3872,7 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
++        /*.prefill_streaming            =*/ false,
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..66a93b3e9 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -39,6 +39,31 @@ struct llama_memory_buffer {
+ 
+ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+ 
++struct dbprefill_sync_probe_state {
++    uint32_t n_tokens = 0;
++};
++
++struct dbprefill_slot {
++    ggml_context_ptr ctx;
++    ggml_backend_buffer_ptr buffer;
++    ggml_tensor * tensor = nullptr;
++    size_t size = 0;
++};
++
++struct dbprefill_timing {
++    int64_t context_start_us = 0;
++    int64_t slot_init_us = 0;
++    int64_t source_read_us = 0;
++    int64_t temporary_alloc_us = 0;
++    int64_t slot_write_us = 0;
++    int64_t slot_fill_us = 0;
++    int64_t graph_build_us = 0;
++    int64_t graph_alloc_us = 0;
++    int64_t input_set_us = 0;
++    int64_t graph_compute_us = 0;
++    int n_layers_filled = 0;
++};
++
+ struct llama_context {
+     // init scheduler and compute buffers, reserve worst-case graphs
+     llama_context(
+@@ -266,6 +291,10 @@ private:
+     // that differs from the layer it belongs to (usually due to missing backend support)
+     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
+ 
++    bool init_prefill_streaming_slots();
++    bool fill_prefill_streaming_slot(int slot, int il);
++    ggml_tensor * bind_prefill_streaming_tensor(ggml_context * ctx, ggml_tensor * tensor, int il) const;
++
+     // TODO: read/write lora adapters and cvec
+     size_t state_write_data(llama_io_write_i & io);
+     size_t state_read_data (llama_io_read_i  & io);
+@@ -345,6 +374,14 @@ private:
+ 
+     bool sched_need_reserve = true;
+ 
++    dbprefill_sync_probe_state dbprefill_probe;
++    bool dbprefill_eval_logged = false;
++    bool dbprefill_slots_filled = false;
++    std::vector<dbprefill_slot> dbprefill_slots;
++    std::vector<std::vector<std::pair<const ggml_tensor *, size_t>>> dbprefill_layer_offsets;
++    std::vector<uint8_t> dbprefill_staging;
++    dbprefill_timing dbprefill_timing_data;
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index b592de18c..eb6dcec4d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -53,6 +53,7 @@ struct llama_cparams {
+     bool op_offload;
+     bool kv_unified;
+     bool pipeline_parallel;
++    bool prefill_streaming;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8ea441f44..16c78ab7f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1491,6 +1491,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     cross            (params.cross),
+     samplers         (params.samplers),
+     cb_func          (params.cb),
++    tensor_bind      (params.tensor_bind),
+     res              (params.res),
+     ctx0             (res->get_ctx()),
+     gf               (res->get_gf()) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index dddfdac7b..8fda59dc5 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -765,6 +765,7 @@ public:
+ 
+ // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
+ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
++using llm_graph_tensor_bind = std::function<ggml_tensor *(ggml_context * ctx, ggml_tensor * tensor, int il)>;
+ 
+ class llm_graph_result;
+ 
+@@ -806,6 +807,7 @@ struct llm_graph_params {
+     uint32_t n_outputs;
+ 
+     llm_graph_cb cb;
++    llm_graph_tensor_bind tensor_bind;
+ 
+     llm_graph_result * res;
+ 
+@@ -1029,6 +1031,7 @@ struct llm_graph_context {
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+     const llm_graph_cb & cb_func;
++    const llm_graph_tensor_bind & tensor_bind;
+ 
+     llm_graph_result * res;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0e0036781..e3251b5c5 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1884,6 +1884,63 @@ uint32_t llama_model::n_gpu_layers() const {
+     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+ }
+ 
++void llama_model::log_prefill_streaming_diagnostics(uint32_t n_tokens) const {
++    std::vector<size_t> layer_bytes(hparams.n_layer_all, 0);
++    size_t non_layer_bytes = 0;
++
++    for (const auto & [name, tensor] : tensors_by_name) {
++        const std::string prefix = "blk.";
++        const size_t prefix_pos = name.find(prefix);
++        if (prefix_pos == std::string::npos) {
++            non_layer_bytes += ggml_nbytes(tensor);
++            continue;
++        }
++
++        size_t pos = prefix_pos + prefix.size();
++        size_t layer = 0;
++        while (pos < name.size() && name[pos] >= '0' && name[pos] <= '9') {
++            layer = layer * 10 + (name[pos] - '0');
++            ++pos;
++        }
++
++        if (pos == prefix_pos + prefix.size() || layer >= layer_bytes.size()) {
++            non_layer_bytes += ggml_nbytes(tensor);
++            continue;
++        }
++
++        layer_bytes[layer] += ggml_nbytes(tensor);
++    }
++
++    size_t largest_layer = 0;
++    size_t total_layer_bytes = 0;
++    for (size_t il = 0; il < layer_bytes.size(); ++il) {
++        total_layer_bytes += layer_bytes[il];
++        largest_layer = std::max(largest_layer, layer_bytes[il]);
++        LLAMA_LOG_INFO("DBPREFILL: layer=%zu bytes=%zu MiB=%.2f\n",
++                il, layer_bytes[il], layer_bytes[il] / 1024.0 / 1024.0);
++    }
++
++    const bool large_prefill = n_tokens >= 1024;
++    LLAMA_LOG_INFO("DBPREFILL: tokens=%u threshold=1024 eligible=%s\n",
++            n_tokens, large_prefill ? "yes" : "no");
++    LLAMA_LOG_INFO("DBPREFILL: layers=%zu largest_layer_bytes=%zu largest_layer_mib=%.2f total_layer_mib=%.2f non_layer_mib=%.2f\n",
++            layer_bytes.size(), largest_layer, largest_layer / 1024.0 / 1024.0,
++            total_layer_bytes / 1024.0 / 1024.0, non_layer_bytes / 1024.0 / 1024.0);
++}
++
++std::vector<const ggml_tensor *> llama_model::get_prefill_streaming_layer_tensors(int il) const {
++    const std::string prefix = "blk." + std::to_string(il) + ".";
++    std::vector<const ggml_tensor *> result;
++
++    for (const auto & [name, tensor] : tensors_by_name) {
++        if (name.rfind(prefix, 0) == 0) {
++            result.push_back(tensor);
++        }
++    }
++
++    return result;
++}
++
+ llama_split_mode llama_model::split_mode() const {
+     return params.split_mode;
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 4c4a30e01..0dbc445a0 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -730,6 +730,9 @@ struct llama_model {
+     uint32_t n_gpu_layers() const;
+     llama_split_mode split_mode() const;
+ 
++    void log_prefill_streaming_diagnostics(uint32_t n_tokens) const;
++    std::vector<const ggml_tensor *> get_prefill_streaming_layer_tensors(int il) const;
++
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+     // total number of parameters in the model
+diff --git a/src/models/deepseek2.cpp b/src/models/deepseek2.cpp
+index 4628ff4da..2702c328f 100644
+--- a/src/models/deepseek2.cpp
++++ b/src/models/deepseek2.cpp
+@@ -463,10 +463,42 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        llama_layer layer = model.layers[il];
++        if (tensor_bind) {
++            auto bind = [&](ggml_tensor * tensor) {
++                return tensor_bind(ctx0, tensor, il);
++            };
++            layer.attn_norm       = bind(layer.attn_norm);
++            layer.attn_q_a_norm   = bind(layer.attn_q_a_norm);
++            layer.attn_kv_a_norm  = bind(layer.attn_kv_a_norm);
++            layer.wq              = bind(layer.wq);
++            layer.wq_a            = bind(layer.wq_a);
++            layer.wq_b            = bind(layer.wq_b);
++            layer.wkv_a_mqa       = bind(layer.wkv_a_mqa);
++            layer.wkv_b           = bind(layer.wkv_b);
++            layer.wk_b            = bind(layer.wk_b);
++            layer.wv_b            = bind(layer.wv_b);
++            layer.wo              = bind(layer.wo);
++            layer.wo_s            = bind(layer.wo_s);
++            layer.ffn_norm        = bind(layer.ffn_norm);
++            layer.ffn_gate        = bind(layer.ffn_gate);
++            layer.ffn_down        = bind(layer.ffn_down);
++            layer.ffn_up          = bind(layer.ffn_up);
++            layer.ffn_gate_inp    = bind(layer.ffn_gate_inp);
++            layer.ffn_up_exps     = bind(layer.ffn_up_exps);
++            layer.ffn_gate_exps   = bind(layer.ffn_gate_exps);
++            layer.ffn_down_exps   = bind(layer.ffn_down_exps);
++            layer.ffn_exp_probs_b = bind(layer.ffn_exp_probs_b);
++            layer.ffn_gate_up_exps = bind(layer.ffn_gate_up_exps);
++            layer.ffn_up_shexp    = bind(layer.ffn_up_shexp);
++            layer.ffn_gate_shexp  = bind(layer.ffn_gate_shexp);
++            layer.ffn_down_shexp  = bind(layer.ffn_down_shexp);
++            layer.wv_b            = bind(layer.wv_b);
++        }
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+-        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
++        cur = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+         // self_attention
+@@ -479,9 +511,9 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+             ggml_tensor * Kcur = NULL;
+             ggml_tensor * Vcur = NULL;
+ 
+-            Qcur = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+-            Kcur = ggml_mul_mat(ctx0, model.layers[il].wk, cur);
+-            Vcur = ggml_mul_mat(ctx0, model.layers[il].wv, cur);
++            Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
++            Kcur = ggml_mul_mat(ctx0, layer.wk, cur);
++            Vcur = ggml_mul_mat(ctx0, layer.wv, cur);
+             cb(Qcur, "q", il);
+             cb(Kcur, "k", il);
+             cb(Vcur, "v", il);
+@@ -497,33 +529,33 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+             cb(Kcur, "k_pe", il);
+ 
+             cur = build_attn(inp_attn_kv,
+-                        model.layers[il].wo, NULL, model.layers[il].wo_s,
++                        layer.wo, NULL, layer.wo_s,
+                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+             cb(cur, "attn_out", il);
+         }
+         else {
+             ggml_tensor * q = NULL;
+ 
+-            const bool is_lite = model.layers[il].wq;
++            const bool is_lite = layer.wq;
+ 
+             if (!is_lite) {
+-                q = ggml_mul_mat(ctx0, model.layers[il].wq_a, cur);
++                q = ggml_mul_mat(ctx0, layer.wq_a, cur);
+                 cb(q, "q", il);
+ 
+-                q = build_norm(q, model.layers[il].attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
++                q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+                 cb(q, "q", il);
+ 
+-                q = ggml_mul_mat(ctx0, model.layers[il].wq_b, q);
++                q = ggml_mul_mat(ctx0, layer.wq_b, q);
+                 cb(q, "q", il);
+             } else {
+-                q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
++                q = ggml_mul_mat(ctx0, layer.wq, cur);
+                 cb(q, "q", il);
+             }
+             // {n_embd_head_k, n_head, n_tokens}
+             q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
+             cb(q, "q", il);
+ 
+-            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
++            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+             cb(kv_cmpr_pe, "kv_cmpr_pe", il);
+ 
+             // split into {kv_lora_rank, n_tokens}
+@@ -543,7 +575,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+                                  ext_factor, attn_factor, beta_fast, beta_slow);
+             cb(k_pe, "k_pe", il);
+ 
+-            kv_cmpr = build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
++            kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+             cb(kv_cmpr, "kv_cmpr", il);
+ 
+             if (is_mla) {
+@@ -566,7 +598,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+                 cb(q_nope, "q_nope_perm", il);
+ 
+                 // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
+-                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, model.layers[il].wk_b, q_nope);
++                    ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+                 cb(q_nope_absorbed, "q_nope_absorbed", il);
+ 
+                 // {kv_lora_rank, n_head, n_tokens}
+@@ -597,10 +629,10 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+ 
+                 // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
+                 cur = build_attn(inp_attn_k,
+-                        model.layers[il].wo, NULL, model.layers[il].wo_s,
+-                        Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, kq_scale, il);
++                        layer.wo, NULL, layer.wo_s,
++                        Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+             } else {
+-                ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_cmpr);
++                ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
+                 cb(kv, "kv", il);
+ 
+                 // split into {n_embd_head_qk_nope, n_head, n_tokens}
+@@ -638,7 +670,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+ 
+                 // note: MLA without the absorption optimization converts into MHA (ie: GQA with full n_head groups)
+                 cur = build_attn(inp_attn_kv,
+-                            model.layers[il].wo, NULL, model.layers[il].wo_s,
++                            layer.wo, NULL, layer.wo_s,
+                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+             }
+         }
+@@ -649,40 +681,40 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+         cb(ffn_inp, "ffn_inp", il);
+ 
+-        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
++        cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+         cb(cur, "ffn_norm", il);
+ 
+         if ((uint32_t) il < hparams.n_layer_dense_lead) {
+             cur = build_ffn(cur,
+-                model.layers[il].ffn_up, NULL, NULL,
+-                model.layers[il].ffn_gate, NULL, NULL,
+-                model.layers[il].ffn_down, NULL, NULL,
++                layer.ffn_up, NULL, NULL,
++                layer.ffn_gate, NULL, NULL,
++                layer.ffn_down, NULL, NULL,
+                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+             cb(cur, "ffn_out", il);
+         } else {
+             // MoE branch
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+-                model.layers[il].ffn_gate_inp,
+-                model.layers[il].ffn_up_exps,
+-                model.layers[il].ffn_gate_exps,
+-                model.layers[il].ffn_down_exps,
+-                model.layers[il].ffn_exp_probs_b,
++                layer.ffn_gate_inp,
++                layer.ffn_up_exps,
++                layer.ffn_gate_exps,
++                layer.ffn_down_exps,
++                layer.ffn_exp_probs_b,
+                 n_expert, n_expert_used,
+                 LLM_FFN_SILU, hparams.expert_weights_norm,
+                 hparams.expert_weights_scale,
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 nullptr,
+-                model.layers[il].ffn_gate_up_exps);
++                layer.ffn_gate_up_exps);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             // FFN shared expert
+             {
+                 ggml_tensor * ffn_shexp =
+                     build_ffn(cur,
+-                        model.layers[il].ffn_up_shexp, NULL, NULL,
+-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
+-                        model.layers[il].ffn_down_shexp, NULL, NULL,
++                        layer.ffn_up_shexp, NULL, NULL,
++                        layer.ffn_gate_shexp, NULL, NULL,
++                        layer.ffn_down_shexp, NULL, NULL,
+                         NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                 cb(ffn_shexp, "ffn_shexp", il);
+ 
+diff --git a/src/models/qwen3moe.cpp b/src/models/qwen3moe.cpp
+index a6a3381e5..a979e4715 100644
+--- a/src/models/qwen3moe.cpp
++++ b/src/models/qwen3moe.cpp
+@@ -78,23 +78,48 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        llama_layer layer = model.layers[il];
++        if (tensor_bind) {
++            auto bind = [&](ggml_tensor * tensor) {
++                return tensor_bind(ctx0, tensor, il);
++            };
++            layer.attn_norm       = bind(layer.attn_norm);
++            layer.wq              = bind(layer.wq);
++            layer.wk              = bind(layer.wk);
++            layer.wv              = bind(layer.wv);
++            layer.wqkv            = bind(layer.wqkv);
++            layer.wqkv_gate       = bind(layer.wqkv_gate);
++            layer.attn_q_norm     = bind(layer.attn_q_norm);
++            layer.attn_k_norm     = bind(layer.attn_k_norm);
++            layer.wo              = bind(layer.wo);
++            layer.wo_b            = bind(layer.wo_b);
++            layer.wo_s            = bind(layer.wo_s);
++            layer.ffn_norm        = bind(layer.ffn_norm);
++            layer.ffn_gate_inp    = bind(layer.ffn_gate_inp);
++            layer.ffn_gate_exps   = bind(layer.ffn_gate_exps);
++            layer.ffn_down_exps   = bind(layer.ffn_down_exps);
++            layer.ffn_up_exps     = bind(layer.ffn_up_exps);
++            layer.ffn_gate_exps_s = bind(layer.ffn_gate_exps_s);
++            layer.ffn_down_exps_s = bind(layer.ffn_down_exps_s);
++            layer.ffn_up_exps_s   = bind(layer.ffn_up_exps_s);
++        }
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+         cur = build_norm(inpL,
+-                model.layers[il].attn_norm, NULL,
++                layer.attn_norm, NULL,
+                 LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+         // self_attention
+         {
+             // compute Q and K and RoPE them
+-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
++            auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur,
+                     n_embd_head, n_head, n_head_kv, il);
+ 
+-            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
++            Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
+             cb(Qcur, "Qcur_normed", il);
+ 
+             Qcur = ggml_rope_ext(
+@@ -103,7 +128,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+                     ext_factor, attn_factor, beta_fast, beta_slow
+                     );
+ 
+-            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
++            Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+             cb(Kcur, "Kcur_normed", il);
+ 
+             Kcur = ggml_rope_ext(
+@@ -117,7 +142,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+             cb(Vcur, "Vcur", il);
+ 
+             cur = build_attn(inp_attn,
+-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
++                    layer.wo, layer.wo_b, layer.wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+         }
+         if (il == n_layer - 1 && inp_out_ids) {
+@@ -129,16 +154,16 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+         // MoE branch
+         cur = build_norm(ffn_inp,
+-                model.layers[il].ffn_norm, NULL,
++                layer.ffn_norm, NULL,
+                 LLM_NORM_RMS, il);
+         cb(cur, "ffn_norm", il);
+ 
+         ggml_tensor * moe_out =
+             build_moe_ffn(cur,
+-                    model.layers[il].ffn_gate_inp,
+-                    model.layers[il].ffn_up_exps,
+-                    model.layers[il].ffn_gate_exps,
+-                    model.layers[il].ffn_down_exps,
++                    layer.ffn_gate_inp,
++                    layer.ffn_up_exps,
++                    layer.ffn_gate_exps,
++                    layer.ffn_down_exps,
+                     nullptr,
+                     n_expert, n_expert_used,
+                     LLM_FFN_SILU, true,
+@@ -146,9 +171,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                     il,
+                     nullptr, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    layer.ffn_up_exps_s,
++                    layer.ffn_gate_exps_s,
++                    layer.ffn_down_exps_s);
+         cb(moe_out, "ffn_moe_out", il);
+         cur = moe_out;
+ 
+diff --git a/tools/llama-bench/README.md b/tools/llama-bench/README.md
+index 8adc56514..2b9f39c18 100644
+--- a/tools/llama-bench/README.md
++++ b/tools/llama-bench/README.md
+@@ -34,6 +34,7 @@ options:
+   -v, --verbose                             verbose output
+   --progress                                print test progress indicators
+   --no-warmup                               skip warmup runs before benchmarking
++  --prefill, --prefill-streaming            enable experimental layer-streamed prefill
+   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
+   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
+   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 1fff21f70..ef884dec1 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -338,6 +338,7 @@ struct cmd_params {
+     std::vector<std::string>         hf_file;
+     std::string                      hf_token;
+     bool                             offline;
++    bool                             prefill_streaming;
+     std::vector<int>                 n_prompt;
+     std::vector<int>                 n_gen;
+     std::vector<std::pair<int, int>> n_pg;
+@@ -383,6 +384,7 @@ static const cmd_params cmd_params_defaults = {
+     /* hf_file              */ {},
+     /* hf_token             */ "",
+     /* offline              */ false,
++    /* prefill_streaming    */ false,
+     /* n_prompt             */ { 512 },
+     /* n_gen                */ { 128 },
+     /* n_pg                 */ {},
+@@ -437,6 +439,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -v, --verbose                               verbose output\n");
+     printf("  --progress                                  print test progress indicators\n");
+     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
++    printf("  --prefill, --prefill-streaming              enable experimental layer-streamed prefill\n");
+     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
+     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
+     if (llama_supports_rpc()) {
+@@ -537,6 +540,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+     params.progress             = cmd_params_defaults.progress;
+     params.no_warmup            = cmd_params_defaults.no_warmup;
+     params.offline              = cmd_params_defaults.offline;
++    params.prefill_streaming    = cmd_params_defaults.prefill_streaming;
+ 
+     if (const char * env = getenv("HF_TOKEN")) {
+         params.hf_token = env;
+@@ -581,6 +585,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                 params.hf_token = argv[i];
+             } else if (arg == "--offline") {
+                 params.offline = true;
++            } else if (arg == "--prefill" || arg == "--prefill-streaming") {
++                params.prefill_streaming = true;
+             } else if (arg == "-p" || arg == "--n-prompt") {
+                 if (++i >= argc) {
+                     invalid_param = true;
+@@ -1246,6 +1252,7 @@ struct cmd_params_instance {
+     int                poll;
+     int                n_gpu_layers;
+     int                n_cpu_moe;
++    bool               prefill_streaming;
+     llama_split_mode   split_mode;
+     llama_load_mode    load_mode;
+     llama_lazy_mode    lazy_mode;
+@@ -1336,6 +1343,7 @@ struct cmd_params_instance {
+         cparams.embeddings      = embeddings;
+         cparams.op_offload      = !no_op_offload;
+         cparams.swa_full        = false;
++        cparams.prefill_streaming = prefill_streaming;
+ 
+         return cparams;
+     }
+@@ -1391,6 +1399,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .poll                  = */ pl,
+                 /* .n_gpu_layers          = */ nl,
+                 /* .n_cpu_moe             = */ ncmoe,
++                /* .prefill_streaming     = */ params.prefill_streaming,
+                 /* .split_mode            = */ sm,
+                 /* .load_mode             = */ lm,
+                 /* .lazy_mode             = */ lzm,
+@@ -1428,6 +1437,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .poll                  = */ pl,
+                 /* .n_gpu_layers          = */ nl,
+                 /* .n_cpu_moe             = */ ncmoe,
++                /* .prefill_streaming     = */ params.prefill_streaming,
+                 /* .split_mode            = */ sm,
+                 /* .load_mode             = */ lm,
+                 /* .lazy_mode             = */ lzm,
+@@ -1465,6 +1475,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .poll                  = */ pl,
+                 /* .n_gpu_layers          = */ nl,
+                 /* .n_cpu_moe             = */ ncmoe,
++                /* .prefill_streaming     = */ params.prefill_streaming,
+                 /* .split_mode            = */ sm,
+                 /* .load_mode             = */ lm,
+                 /* .lazy_mode             = */ lzm,
+@@ -2358,12 +2369,16 @@ int llama_bench(int argc, char ** argv) {
+        }
+ 
+         // keep the same model between tests when possible
+-        if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
++        const bool model_reused = lmodel && prev_inst && inst.equal_mparams(*prev_inst);
++        if (!model_reused) {
+             if (lmodel) {
+                 llama_model_free(lmodel);
+             }
+ 
++            const uint64_t model_load_start_ns = get_time_ns();
+             lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
++                fprintf(stderr, "DBPREFILL: bench_timing model_load_ms=%.3f reused=no\n",
++                    (get_time_ns() - model_load_start_ns) / 1e6);
+             if (lmodel == NULL) {
+                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
+                 return 1;
+@@ -2371,7 +2386,11 @@ int llama_bench(int argc, char ** argv) {
+             prev_inst = &inst;
+         }
+ 
++        const uint64_t context_init_start_ns = get_time_ns();
+         llama_context * ctx = llama_init_from_model(lmodel, cparams);
++        fprintf(stderr, "DBPREFILL: bench_timing context_init_ms=%.3f model_reused=%s\n",
++            (get_time_ns() - context_init_start_ns) / 1e6,
++            model_reused ? "yes" : "no");
+         if (ctx == NULL) {
+             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
+             llama_model_free(lmodel);

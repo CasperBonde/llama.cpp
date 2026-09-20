@@ -1,0 +1,31 @@
+./build/bin/llama-bench -m models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf -ngl 99 -b 512 -ub 16,32,64,128,256 --flash-attn on --cache-type-k q4_0 --cache-type-v q4_0 -n 0 -p 512 | tee Qwen-1.5b_performance.txt
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+| model                          |       size |     params | backend    | ngl | n_batch | n_ubatch | type_k | type_v |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ------: | -------: | -----: | -----: | --: | --------------: | -------------------: |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |     512 |       16 |   q4_0 |   q4_0 |   1 |           pp512 |        288.05 ± 0.30 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |     512 |       32 |   q4_0 |   q4_0 |   1 |           pp512 |        322.65 ± 0.43 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |     512 |       64 |   q4_0 |   q4_0 |   1 |           pp512 |        341.66 ± 0.35 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |     512 |      128 |   q4_0 |   q4_0 |   1 |           pp512 |        352.23 ± 0.35 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |     512 |      256 |   q4_0 |   q4_0 |   1 |           pp512 |        360.05 ± 0.14 |
+
+
+
+
+
+
+ ./build/bin/llama-bench -m models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf -ngl 99 -b 2048 -ub 16,128,256,512 --flash-attn on --cache-type-k q4_0 --cache-type-v q4_0 --mmap 0 -lm none -n 0 -p 2048
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 3716 MiB):
+  Device 0: Quadro T1000, compute capability 7.5, VMM: yes, VRAM: 3716 MiB
+DEPRECATED: -mmp and --mmap are deprecated in favour of --load-mode. Please use --load-mode mmap instead.
+| model                          |       size |     params | backend    | ngl | n_ubatch | type_k | type_v |  fa |         lm |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -------: | -----: | -----: | --: | ---------: | --------------: | -------------------: |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |       16 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        264.60 ± 0.44 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |      128 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        312.00 ± 0.51 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |      256 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        318.33 ± 0.12 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |      512 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        318.29 ± 0.08 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |       16 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        264.12 ± 0.32 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |      128 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        311.57 ± 0.61 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |      256 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        318.41 ± 0.11 |
+| qwen2 1.5B Q4_K - Medium       |   1.04 GiB |     1.78 B | CUDA       |  99 |      512 |   q4_0 |   q4_0 |   1 |       none |          pp2048 |        318.34 ± 0.07 |
+

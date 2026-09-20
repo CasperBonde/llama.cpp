@@ -1,0 +1,29 @@
+device            : Quadro T1000 cc 7.5, 14 SMs
+cudaDevAttrAsyncEngineCount : 3
+prop.asyncEngineCount       : 3
+memoryClockRate   : 4001000 kHz, busWidth 128 bit
+pciBusID          : 
+
+-- device DRAM --
+512 MiB read+write x1         14.33 ms  ->  74.9 GB/s
+512 MiB read+write x4         38.89 ms
+
+-- host to device --
+copy alone 512 MiB            43.47 ms  ->  12.35 GB/s
+
+-- overlap: DRAM kernel + H2D copy --
+dram alone                    38.89 ms
+copy alone                    43.47 ms
+dram while copying            43.84 ms  (113% of alone)
+copy while dram runs          43.41 ms  ->  12.37 GB/s (100% of alone rate)
+serialized would be           82.36 ms
+max() would be                43.47 ms
+verdict: copy coexists with a DRAM-hungry kernel -> VRAM bus is NOT the blocker
+
+-- overlap: ALU kernel + H2D copy --
+alu alone                     37.54 ms
+copy alone                    43.47 ms
+both                          37.52 ms
+serialized would be           81.01 ms
+max() would be                43.47 ms
+verdict: OVERLAP works when only the SMs are busy

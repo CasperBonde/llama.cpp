@@ -1,0 +1,16 @@
+# correctness across multiple ubatches, -b == -ub == 512, greedy
+# model: models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf
+# date: 2026-09-16T08:34:22+02:00
+# build: 27543a7ae
+
+##### b == ub == 512 #####
+--- baseline ---
+--- streaming ---
+
+##### b == ub == 1024 #####
+--- baseline ---
+--- streaming ---
+
+##### b == ub == 2048 #####
+--- baseline ---
+--- streaming ---
