@@ -286,6 +286,15 @@ static const char * cu_get_error_str(CUresult err) {
 #define TURING_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 
+// Whether the MMQ SRAM tiles use the mma data layout. Separate from TURING_MMA_AVAILABLE because
+// flash attention needs its tensor core kernels regardless, while MMQ can be built for a Turing
+// part without tensor cores (cc 75 that is TU117 rather than TU106/TU116). GGML_CUDA_TURING_NO_MMA
+// excludes the Turing family only; Ampere and newer keep their tensor cores.
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && \
+    !(defined(GGML_CUDA_TURING_NO_MMA) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE)
+#define MMQ_MMA_TILE
+#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define AMPERE_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -354,6 +363,17 @@ static bool volta_mma_available(const int cc) {
 
 static bool turing_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING;
+}
+
+static bool turing_uses_dp4a_tiles(const int cc) {
+#ifdef GGML_CUDA_TURING_NO_MMA
+    return GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING &&
+        ggml_cuda_highest_compiled_arch(cc) <  GGML_CUDA_CC_AMPERE;
+#else
+    GGML_UNUSED(cc);
+    return false;
+#endif // GGML_CUDA_TURING_NO_MMA
 }
 
 static bool ampere_mma_available(const int cc) {
@@ -1147,6 +1167,7 @@ struct ggml_cuda_device_info {
 
     struct cuda_device_info {
         int     cc;                             // compute capability
+        bool    tensor_cores;                   // whether this device has usable tensor cores
         int     nsm;                            // number of streaming multiprocessors
         size_t  smpb;                           // max. shared memory per block
         size_t  smpbo;                          // max. shared memory per block (with opt-in)
@@ -1170,6 +1191,27 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+
+// Whether the tensor core path can be used on the device at hand. cc alone cannot answer this for
+// the 75 family: TU117 has no tensor cores while TU106 and TU116 do, and all three report cc 75.
+// The device info carries the answer. A build that turns the Turing tensor core path off also
+// answers false, so that callers never select kernels that are not in the binary.
+static bool turing_mma_available_dev() {
+#ifdef GGML_CUDA_TURING_NO_MMA
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!turing_mma_available(cc)) {
+        return false;
+    }
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    const int id = ggml_cuda_get_device();
+    if (id >= 0 && id < info.device_count) {
+        return info.devices[id].tensor_cores;
+    }
+    return info.devices[0].tensor_cores;
+#endif // GGML_CUDA_TURING_NO_MMA
+}
 
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;

@@ -187,18 +187,25 @@ struct ggml_cuda_mmq_config {
 
     // TODO transition all combinations of GPUs and quantizations to the MMA data layout.
     __host__ int use_mma_data_layout(const int cc) const {
-        if (amd_mfma_available(cc) || amd_wmma_available(cc) || turing_mma_available(cc)) {
+        if (amd_mfma_available(cc) || amd_wmma_available(cc)) {
             return true;
         }
-        return false;
+#ifdef GGML_CUDA_TURING_NO_MMA
+        // a build that forces the dp4a path lays its tiles out the dp4a way for Turing
+        if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING &&
+            ggml_cuda_highest_compiled_arch(cc) <  GGML_CUDA_CC_AMPERE) {
+            return false;
+        }
+#endif // GGML_CUDA_TURING_NO_MMA
+        return turing_mma_available(cc);
     }
 
     constexpr __device__ bool use_mma_data_layout() const {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(MMQ_MMA_TILE)
         return true;
 #else
         return false;
-#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(MMQ_MMA_TILE)
     }
 
 };
@@ -245,7 +252,14 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (blackwell_mma_available(cc)) {
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
+    // Keep the tile table and the shared memory tile format consistent: the table decides the
+    // tiling hints and use_mma_data_layout decides how the tiles are laid out in SRAM, and the two
+    // have to agree. That agreement is a property of the build, not of the device, which is why
+    // this asks turing_uses_dp4a_tiles and not the device info.
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
+        if (turing_uses_dp4a_tiles(cc)) {
+            return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
+        }
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
@@ -270,6 +284,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+#elif defined(GGML_CUDA_TURING_NO_MMA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+    return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A

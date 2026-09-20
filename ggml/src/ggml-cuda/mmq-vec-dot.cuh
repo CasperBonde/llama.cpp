@@ -525,7 +525,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
-#elif defined(TURING_MMA_AVAILABLE)
+#elif defined(MMQ_MMA_TILE)
 
     typedef tile<16, 4, int> tile_A;
     typedef tile<16, 8, int> tile_A_8;
@@ -742,7 +742,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
-#elif defined(TURING_MMA_AVAILABLE)
+#elif defined(MMQ_MMA_TILE)
 
     typedef tile<16, 4, int> tile_A;
     typedef tile<16, 8, int> tile_A_8;
@@ -1060,7 +1060,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
-#elif defined(TURING_MMA_AVAILABLE)
+#elif defined(MMQ_MMA_TILE)
 
     typedef tile<16, 4, int> tile_A;
     typedef tile< 8, 4, int> tile_B;

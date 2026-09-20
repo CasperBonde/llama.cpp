@@ -309,7 +309,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }
     }
 
-    if (turing_mma_available(cc)) {
+    if (turing_mma_available_dev()) {
         return true;
     }
 
@@ -324,6 +324,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        // A Turing device without tensor cores has no fp16 MMA to fall back on, so MMQ is the
+        // fastest path at every batch size. fp16_mma_hardware_available only looks at cc, which
+        // cannot tell such a device apart from one that does have tensor cores.
+        if (!turing_mma_available_dev() && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING) {
+            return true;
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 

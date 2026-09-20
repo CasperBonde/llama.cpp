@@ -271,6 +271,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
     total_vram = 0;
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
+
     for (int id = 0; id < info.device_count; ++id) {
         const int physical_id = info.devices[id].physical_device;
 
@@ -354,11 +355,16 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
         std::string device_name(prop.name);
-        if (device_name == "NVIDIA GeForce MX450") {
-            turing_devices_without_mma.push_back({ id, device_name });
-        } else if (device_name == "NVIDIA GeForce MX550") {
-            turing_devices_without_mma.push_back({ id, device_name });
-        } else if (device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
+        // cc 75 covers both the Turing dies with tensor cores (TU106, TU116) and TU117 without.
+        // CUDA has no attribute for the tensor pipe, so the name decides. Only add names here that
+        // are certainly TU117: a false negative just leaves the old behaviour in place, a false
+        // positive would take the tensor cores away from a device that has them.
+        info.devices[id].tensor_cores = true;
+        if (device_name == "NVIDIA GeForce MX450" ||
+            device_name == "NVIDIA GeForce MX550" ||
+            device_name.find("Quadro T1000") != std::string::npos ||
+            device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
+            info.devices[id].tensor_cores = false;
             turing_devices_without_mma.push_back({ id, device_name });
         }
 
@@ -375,13 +381,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
-        GGML_LOG_INFO("The following devices will have suboptimal performance due to a lack of tensor cores:\n");
+        GGML_LOG_INFO("The following devices have no tensor cores and will use the dp4a MMQ path instead:\n");
         for (size_t device_pos = 0; device_pos < turing_devices_without_mma.size(); device_pos++) {
             GGML_LOG_INFO(
                 "  Device %d: %s\n", turing_devices_without_mma[device_pos].first, turing_devices_without_mma[device_pos].second.c_str());
         }
-        GGML_LOG_INFO(
-            "Consider compiling with CMAKE_CUDA_ARCHITECTURES=61-virtual;80-virtual and DGGML_CUDA_FORCE_MMQ to force the use of the Pascal code for Turing.\n");
     }
 
     for (int id = 0; id < info.device_count; ++id) {
