@@ -413,6 +413,7 @@ private:
     int64_t prefill_streaming_serial_ask_us = 0;  // timestamp of the last ask (start of compute)
     size_t  prefill_streaming_n_refill_sync = 0;  // refills that waited for the copy
     // per-layer phases of the serial mode, microseconds
+    std::vector<int>     prefill_streaming_serial_layer;
     std::vector<int64_t> prefill_streaming_serial_refill_us;
     std::vector<int64_t> prefill_streaming_serial_compute_us;
 

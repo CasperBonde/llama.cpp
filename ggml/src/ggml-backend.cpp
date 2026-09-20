@@ -1651,6 +1651,26 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// LLAMA_SCHED_SYNC_AUDIT: the scheduler synchronizes the split backend after every graph range
+// it submits, because the eval callback can refill storage that the running range may still read.
+// That makes it a correctness barrier, so the useful question is not whether it can be dropped
+// but how much of the ubatch it accounts for. These counters answer that.
+struct ggml_backend_sched_sync_audit {
+    int64_t n_sync     = 0;  // timed synchronize calls
+    int64_t sync_us    = 0;  // their total wall time
+    int64_t n_range    = 0;  // graph ranges submitted on the callback path
+    int64_t n_callback = 0;  // callback_eval invocations
+};
+
+static ggml_backend_sched_sync_audit g_sched_sync_audit;
+
+void ggml_backend_sched_sync_audit_dump(void) {
+    GGML_LOG_INFO("%s: per-split synchronize %lld calls, %.3f ms total, %lld ranges, %lld callbacks\n",
+            __func__, (long long) g_sched_sync_audit.n_sync, g_sched_sync_audit.sync_us/1000.0,
+            (long long) g_sched_sync_audit.n_range, (long long) g_sched_sync_audit.n_callback);
+    g_sched_sync_audit = {};
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1658,6 +1678,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+
+    const bool sync_audit = getenv("LLAMA_SCHED_SYNC_AUDIT") != nullptr;
+    // LLAMA_SCHED_NO_SPLIT_SYNC: measurement only. the synchronize is a correctness barrier
+    // (the eval callback can refill storage the running range still reads), so dropping it
+    // produces wrong results. it is used to measure how much of the ubatch it accounts for.
+    const bool no_split_sync = getenv("LLAMA_SCHED_NO_SPLIT_SYNC") != nullptr;
+    auto sync_timed = [&](ggml_backend_t b) {
+        if (no_split_sync) {
+            return;
+        }
+        if (!sync_audit) {
+            ggml_backend_synchronize(b);
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_synchronize(b);
+        g_sched_sync_audit.n_sync++;
+        g_sched_sync_audit.sync_us += ggml_time_us() - t0;
+    };
 
     int prev_backend_id = -1;
 
@@ -1687,7 +1726,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    sync_timed(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1695,7 +1734,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    sync_timed(split_backend);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1791,7 +1830,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            sync_timed(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
@@ -1811,6 +1850,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // check if the user needs data from this node
                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                if (sync_audit) { g_sched_sync_audit.n_callback++; }
 
                 int j1 = j0;
 
@@ -1828,7 +1868,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                if (sync_audit) { g_sched_sync_audit.n_range++; }
+                sync_timed(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -2030,7 +2071,17 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    if (getenv("LLAMA_SCHED_SYNC_AUDIT") != nullptr) {
+        g_sched_sync_audit = {};
+    }
+
+    const enum ggml_status st = ggml_backend_sched_compute_splits(sched);
+
+    if (getenv("LLAMA_SCHED_SYNC_AUDIT") != nullptr) {
+        ggml_backend_sched_sync_audit_dump();
+    }
+
+    return st;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

@@ -639,6 +639,7 @@ bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
         const int64_t serial_refill_us = ggml_time_us() - t_fill;
 
         prefill_streaming_serial_hold = next;
+        prefill_streaming_serial_layer.push_back(il);
         prefill_streaming_serial_compute_us.push_back(serial_compute_us);
         prefill_streaming_serial_refill_us.push_back(serial_refill_us);
         prefill_streaming_n_refill_sync++;
@@ -2122,6 +2123,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     prefill_streaming_n_refill_sync = 0;
     prefill_streaming_serial_hold   = -1;
     prefill_streaming_serial_ask_us = 0;
+    prefill_streaming_serial_layer.clear();
     prefill_streaming_serial_refill_us.clear();
     prefill_streaming_serial_compute_us.clear();
 
@@ -2284,6 +2286,42 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     100.0*refill_sum/(refill_sum + compute_sum),
                     refill_sum > 0 ? prefill_streaming_fill_bytes/(double)refill_sum/1000.0 : 0.0,
                     100.0*compute_sum/(refill_sum + compute_sum));
+
+            // one mean over every layer hides the effect if only one of the two layer types is
+            // slow, so report them apart. GDN layers are linear attention, the rest are full
+            // attention. both read one streamed layer, so any gap here is not the copy.
+            int64_t n_recr = 0, sum_recr = 0, min_recr = -1, max_recr = 0;
+            int64_t n_attn = 0, sum_attn = 0, min_attn = -1, max_attn = 0;
+            for (size_t i = 0; i < prefill_streaming_serial_compute_us.size(); ++i) {
+                const int il = i < prefill_streaming_serial_layer.size() ? prefill_streaming_serial_layer[i] : -1;
+                if (il < 0) { continue; }
+                int64_t &       s = model.hparams.is_recr((uint32_t) il) ? sum_recr : sum_attn;
+                int64_t &       n = model.hparams.is_recr((uint32_t) il) ? n_recr   : n_attn;
+                int64_t &     vmin = model.hparams.is_recr((uint32_t) il) ? min_recr : min_attn;
+                int64_t &     vmax = model.hparams.is_recr((uint32_t) il) ? max_recr : max_attn;
+                const int64_t v = prefill_streaming_serial_compute_us[i];
+                s += v; n++;
+                if (vmin < 0 || v < vmin) { vmin = v; }
+                if (v > vmax) { vmax = v; }
+            }
+            LLAMA_LOG_INFO("%s: serial compute by layer type: GDN %lld layers %.3f ms mean (%.3f-%.3f), attention %lld layers %.3f ms mean (%.3f-%.3f)\n",
+                    __func__, (long long) n_recr, n_recr ? sum_recr/(double)n_recr/1000.0 : 0.0,
+                    min_recr/1000.0, max_recr/1000.0,
+                    (long long) n_attn, n_attn ? sum_attn/(double)n_attn/1000.0 : 0.0,
+                    min_attn/1000.0, max_attn/1000.0);
+
+            // LLAMA_PREFILL_STREAMING_SERIAL_LIST: every layer, in order. a ramp or a step
+            // change is not visible in a mean, and those have different causes.
+            if (getenv("LLAMA_PREFILL_STREAMING_SERIAL_LIST")) {
+                for (size_t i = 0; i < prefill_streaming_serial_compute_us.size(); ++i) {
+                    const int il = i < prefill_streaming_serial_layer.size() ? prefill_streaming_serial_layer[i] : -1;
+                    LLAMA_LOG_INFO("%s:   layer %2d %s refill %.3f ms compute %.3f ms\n",
+                            __func__, il,
+                            il >= 0 && model.hparams.is_recr((uint32_t) il) ? "gdn" : "attn",
+                            prefill_streaming_serial_refill_us[i]/1000.0,
+                            prefill_streaming_serial_compute_us[i]/1000.0);
+                }
+            }
         }
     }
 
