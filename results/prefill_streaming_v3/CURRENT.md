@@ -118,15 +118,16 @@ Direct measurement, reference config, `-r 4`, `nvidia-smi` sampled at 0.5 s:
 inside a launched grid. That is consistent with an SM-attached occupancy of 100% and a DRAM
 utilization of 8-15%: the memory system is not saturated either.
 
-**The cause is found: the host is blocked in the per-split synchronize, so the SMs run out of
-work.** See section 6.3 and `SYNC_BARRIER.md`. The host is inside
-`ggml_backend_synchronize(split_backend)` for 65.8% of the ubatch at `-ngl 1` and 73.1% at
-`-ngl 99`, and removing it takes pp1024 from 81.45 to 115.46 t/s. So "occupancy 100%" was never a
-statement about work issued - it is satisfied by the one range that is resident while the host
-waits for it to retire.
+**The cause is NOT a host stall. That claim is retracted.** See section 6.3 and `TIMELINE.md`.
+What is measured is a synchronize whose timer reads 65.8% of the ubatch at `-ngl 1` and 73.1% at
+`-ngl 99`, but an event on the same stream measures the *same* interval as device execution. The
+host is waiting for the GPU, not the GPU for the host, and the host-side remainder outside the copy
+is under 1.5% of the ubatch. Removing the barrier still takes pp1024 from 81.45 to 115.46 t/s; the
+gain is real, the mechanism I attached to it was not.
 
-This also answers the earlier framing of this section. The wait was attributed to memory latency
-and later to the kernel's shape. It is neither: it is a host-side serialization of the graph.
+So "occupancy 100%" remains a statement that a grid is resident, and the earlier framing stands: the
+wait is inside the kernel, not in the host. Section 4.1 (power) is the evidence that the kernel is
+not doing proportional work.
 
 ### 4.1 Power: the independent confirmation
 
@@ -341,7 +342,7 @@ inside the compute time.
 This correction does **not** touch the pp2048 cliff (6.8), which is real and is about the
 new-graph path, not about overlap.
 
-### 6.3 The split sync is the stall, and it is also a correctness barrier
+### 6.3 The split sync is a correctness barrier, and I mislabelled its cost
 
 `ggml_backend_synchronize(split_backend)` at `ggml/src/ggml-backend.cpp:1831` is called after every
 graph range the scheduler submits. It is not a scheduling wart to be removed: gating it behind
@@ -351,20 +352,30 @@ is done while it is still running, and refills the slot the running layer may st
 `ggml_backend_cuda_synchronize` is `cudaStreamSynchronize(cuda_ctx->stream())` - stream-scoped,
 not device-wide.
 
-Measured with `LLAMA_SCHED_SYNC_AUDIT=1`, the host is inside that synchronize for **65.8% of the
-ubatch at `-ngl 1` (8690.9 of 13211.6 ms) and 73.1% at `-ngl 99` (10065.6 of 13764.6 ms)**. This is
-the answer to section 4: the SMs are not short of work, the host will not feed them. See
-`SYNC_BARRIER.md` for the full table and method.
+With `LLAMA_SCHED_SYNC_AUDIT=1` the interval bracketing that synchronize measures **65.8% of the
+ubatch at `-ngl 1` (8690.9 of 13211.6 ms) and 73.1% at `-ngl 99` (10065.6 of 13764.6 ms)**. I read
+that as host wait. It is not. An event recorded on the same stream, on the same ranges, measures
+8690.9 ms and 10004.2 ms - the same interval - and the stream synchronize behind it then finds the
+stream drained (0.547 ms total, max 0.007 ms). **The interval is device execution time, and the
+host is waiting for the GPU, correctly, as a synchronize must.** See `TIMELINE.md`.
+
+So section 4's earlier claim that "the host will not feed them" is withdrawn. The host-side
+remainder outside the copy is under 1.5% of the ubatch in both configurations. The reason the
+barrier costs 3838 ms at `-ngl 1` is narrower and duller: in the serial window the blocking copy
+cannot overlap the compute while the barrier is obeyed, and 3838 ms is 103% of the 3713 ms copy. In
+the normal two-slot window the copy is already asynchronous, which is why overlap alone bought only
+1.4% there.
 
 Consequence: 115-117 t/s is the speed of a broken pipeline, not a target. Any scheme that removes
 the barrier must first prove the slot is not being read. **And every per-layer compute number in
 this investigation is conditional on the barrier being present** - with it removed the measured
-"compute" collapses to ~0 because nothing forces the host to wait for the GPU at all.
+"compute" collapses to ~0 because nothing forces the host to wait for the GPU at all. The event
+probe removes that condition.
 
 Historical note on how this was missed: an earlier session measured "32-bit loads plus 1 block/SM
 are the smoking gun, vectorising the load is worth 2.50x", which was traced to a synthetic kernel
 with a *runtime* trip count. The real kernel was exonerated (7944 straight-line instructions, the
-load loop fully unrolled). The stall was host-side all along.
+load loop fully unrolled).
 
 ### 6.4 L2 is not thrashing
 
@@ -509,7 +520,7 @@ layers 0-5 only:
 
 Layers 6-45 are *faster* per layer at `-ngl 99` than at `-ngl 1` (GDN 177.2 vs 125.3 means the
 GPU work genuinely grew, but the spread is gone). The entire `-ngl 99` deficit is the first six
-layers. See `SYNC_BARRIER.md` section 3 for what those six layers are really measuring.
+layers. See `TIMELINE.md` for what those six layers are actually doing: they are device work.
 
 ### Status
 
@@ -520,12 +531,14 @@ layers. See `SYNC_BARRIER.md` section 3 for what those six layers are really mea
 
 ## 8. Open questions, in priority order
 
-1. **The SM is not short of work; the host will not feed it.** SOLVED, see `SYNC_BARRIER.md`.
-   `ggml_backend_sched_compute_splits` blocks in `ggml_backend_synchronize(split_backend)` after
-   every graph range: **8690.9 ms of a 13211.6 ms ubatch (65.8%)** at `-ngl 1` and **10065.6 ms of
-   13764.6 ms (73.1%)** at `-ngl 99`. Removing it takes pp1024 from 81.45 to **115.46 t/s**
-   (`-ngl 1`) and 74.95 to **117.08 t/s** (`-ngl 99`). 115.46 reproduces the 115.59 recorded
-   earlier by a different route.
+1. **Per-node GPU time is 17.1% higher at `-ngl 99`.** OPEN. The stall framing that used to sit
+   here was wrong and is withdrawn (`TIMELINE.md` section 0). `ggml_backend_sched_compute_splits`
+   calls `ggml_backend_synchronize(split_backend)` after every graph range: the measured interval
+   is **8690.9 ms of a 13211.6 ms ubatch (65.8%)** at `-ngl 1` and **10065.6 ms of 13764.6 ms
+   (73.1%)** at `-ngl 99`, but an event on the same stream measures the same interval as device
+   execution. Removing the barrier takes pp1024 from 81.45 to **115.46 t/s** (`-ngl 1`) and 74.95
+   to **117.08 t/s** (`-ngl 99`). 115.46 reproduces the 115.59 recorded earlier by a different
+   route.
    **Still open: the fix.** The barrier is a correctness requirement (the eval callback refills
    storage a running range may still read), so 115-117 t/s is the speed of a broken pipeline, not
    a target. The remaining question is how to keep the ordering without blocking the host.
@@ -535,15 +548,23 @@ layers. See `SYNC_BARRIER.md` section 3 for what those six layers are really mea
 3. **Build the valid copy control** (T2.2.1): refill the slot from a VRAM-resident copy
    (host -> VRAM once, then VRAM -> VRAM). NOCOPY is not it.
 4. **The 2x512 single-run loss** (section 7). Blocked on 3.
-5. **Why do layers 0-5 stall 2.6x longer than layers 6-45 at `-ngl 99`?** The spike is a barrier
-   stall (SYNC_BARRIER.md 3), not compute, but why it concentrates in the first six layers is not
-   explained.
+5. **Why do layers 0-5 take 2.6x longer than layers 6-45 at `-ngl 99`?** The spike is device work,
+   not a barrier stall (SYNC_BARRIER.md 3), but why it concentrates in the first six layers is not
+   explained. This now sits inside the section 4 question of where the GPU time goes.
 
 ---
 
 ## 9. Retracted / withdrawn (do not cite these)
 
 - **"The GPU is idle 88.5% of the wall time"** - retracted. See section 4. Source run was 11.94 t/s.
+- **"The per-split synchronize is the stall: the host blocks there for 66-73% of the ubatch and the
+  SMs run out of work"** - **retracted.** The 66-73% interval is real but it is device execution
+  time, not host wait. An event on the same stream measures 8690.9 ms where the CPU-side timer
+  measured 8690.9 ms, and the stream synchronize behind it then finds the stream drained (0.547 ms
+  total). The host-side remainder outside the copy is under 1.5% of the ubatch in both `-ngl`
+  configurations. The t/s gains from removing the barrier are real; the mechanism was not. See
+  `TIMELINE.md`. This also voids the "-ngl 99 makes the barrier 16x more expensive per call" reading:
+  longer ranges simply take longer to execute.
 - **"32-bit loads plus 1 block/SM are the smoking gun; vectorising the load is worth 2.50x"** -
   withdrawn. `tmp/prof/mmqstruct.cu` passed the tile size as a **runtime** argument, so its load
   loop could not unroll and each thread had one 4-byte load in flight. `tmp/prof/unroll.cu` shows

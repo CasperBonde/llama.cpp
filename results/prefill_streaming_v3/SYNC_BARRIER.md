@@ -1,38 +1,47 @@
-# The per-split synchronize is the stall
+# The per-split synchronize is NOT a stall - retracted
 
 Measured 2026-09-20, build `27543a7ae` + instrumentation. Model
 Qwen3-Next-80B-A3B-Instruct-Q4_K_M, `-ncmoe 99 -lm none -p 1024 -b 1024 -ub 1024 -r 1 -t 6`,
 `-ps 1`, serial measurement window (`LLAMA_PREFILL_STREAMING_SERIAL=1`).
 
-This is the answer to the question the whole investigation was built around: why the card is
-resident and busy yet draws 18.8 W of a 50 W budget.
+> **RETRACTED by `TIMELINE.md`.** The heading and the central claim of this document were wrong.
+> The 8690.9 ms counted here as "sync time" is GPU execution time, not host wait. An event placed
+> on the same stream measures the same 8690.9 ms and drops the stream sync to 0.547 ms. The
+> number was real, the label inverted the conclusion. The measurements in sections 1 to 3 below
+> are still correct; the interpretation is not. See `TIMELINE.md` for the corrected time-line.
 
-## 0. The finding in one line
+This was the answer I thought closed the question of why the card is resident and busy yet draws
+18.8 W of a 50 W budget. It does not. That question is still open.
+
+## 0. The claim, as it was made (now known to be wrong)
 
 `ggml_backend_sched_compute_splits` calls `ggml_backend_synchronize(split_backend)` after
-**every** graph range it submits, and the host blocks there for 66-73% of the ubatch. Removing it
-takes pp1024 from 81.45 to **115.46 t/s** at `-ngl 1` and from 74.95 to **117.08 t/s** at `-ngl 99`.
+**every** graph range it submits, and I read the host as blocking there for 66-73% of the ubatch.
+The time is real; the host is not blocking. It is waiting for the device to finish work it has
+already submitted, which is exactly what a synchronize is for.
 
-## 1. The barrier accounts for most of the ubatch
+## 1. What the numbers in the table actually are
 
 Instrumented with `LLAMA_SCHED_SYNC_AUDIT=1` (counts and times every synchronize the scheduler
-performs at the split level; see `GGML_SCHED_SYNC_AUDIT` block in `ggml/src/ggml-backend.cpp`).
+performs at the split level).
 
-| `-ngl` | sync calls | sync time | ranges | callbacks | ubatch | sync share |
+| `-ngl` | sync calls | measured at the sync | ranges | callbacks | ubatch | share |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 679 | **8690.9 ms** | 290 | 290 | 13211.6 ms | **65.8%** |
+| 1 | 679 | **8690.9 ms** | 290 | 290 | 13211.6 ms | 65.8% |
 | 1 | 679 | 8646.3 ms | 290 | 290 | 12568.7 ms | 68.8% |
-| 99 | 61 | **10065.6 ms** | 50 | 50 | 13764.6 ms | **73.1%** |
+| 99 | 61 | **10065.6 ms** | 50 | 50 | 13764.6 ms | 73.1% |
 | 99 | 61 | 10006.9 ms | 50 | 50 | 13660.3 ms | 73.3% |
 
-The second line of each pair is the reused-graph pass, which is the one llama-bench reports.
+These four numbers are correct. Both later measurements confirm them: the event on the same
+stream reports 8690.9 / 8645.0 / 10059.5 / 10004.2 ms on the same ranges. The error was only in
+calling them host wait. They are GPU execution time that the CPU-side timer absorbed.
 
-Two things to note:
+Two things to note, both still true:
 
-- The host is inside `ggml_backend_synchronize` for two thirds of the ubatch. That is time it
-  cannot spend submitting the next range.
-- `-ngl 99` makes *fewer* but *much longer* stalls: 61 syncs of **165 ms** average, against 679
-  syncs of **12.8 ms** average at `-ngl 1`. Same total wall time in the barrier.
+- The measured interval scales with the work in the range, not with any host cost.
+- `-ngl 99` makes *fewer* but *much longer* intervals: 61 of **165 ms** average, against 679 of
+  **12.8 ms** average at `-ngl 1`. That is what first drew attention here, and it is the red flag
+  that `TIMELINE.md` section 4 quantifies: 17.1% more GPU time per node.
 
 ## 2. Removing the barrier
 
@@ -80,28 +89,39 @@ passes, so it is not warmup.
 
 The earlier conclusion drawn from the grouped means - "processing the whole layer on the GPU costs
 61% more per layer, so GPU-resident attention is expensive" - was **wrong**. The grouped means were
-an artifact of a 2.6x spike in the first six layers, and the spike is a barrier stall, not compute.
-The two errors cancelled into a plausible-looking story about attention, which is why it lasted.
+an artifact of a 2.6x spike in the first six layers. The retraction was right; the reason given for
+it here ("the spike is a barrier stall, not compute") was also wrong. The spike IS device work.
 
 With the barrier off the `-ngl 99` ubatch is 3647.8 ms and the measured compute is ~0, because with
 nothing forcing the host to wait the callbacks no longer bracket the GPU work. That is the tell:
 **the per-split synchronize is what makes the callback interval a usable compute measurement.** All
 per-layer compute numbers in this investigation are conditional on the barrier being present, and
-each one therefore contains an unknown amount of host-block time.
+each one therefore contains an unknown amount of host-block time. The event probe in `TIMELINE.md`
+removes that condition.
 
-## 4. Why this is the power answer
+## 4. Why I thought this was the power answer (retracted)
 
-The SMs are not short of work; the host will not feed them. Every range is followed by a blocking
-`cudaStreamSynchronize`, so the next range is submitted only after the previous one has fully
-retired, plus whatever the eval callback does in between. The GPU sits idle in that window.
+> **RETRACTED.** The mechanism below is wrong. The probe shows the device is executing during the
+> measured interval, and the host-side remainder is under 1.5% of the ubatch, so the host is not
+> withholding work and the GPU is not idling in that window. The t/s gains in section 2 are real;
+> the explanation here is not. Where the energy actually goes is still open.
 
-That is consistent with everything already measured:
+The SMs are not short of work; I claimed the host will not feed them. Every range is followed by a
+blocking `cudaStreamSynchronize`, so the next range is submitted only after the previous one has
+fully retired, plus whatever the eval callback does in between - and I claimed the GPU sits idle in
+that window. **The probe refutes the last step.** The event records on the same stream and the
+event wait absorbs the same interval, so the device is executing throughout it. The host is inside
+the synchronize because the synchronize is doing its job.
+
+The observations below are unaffected by the retraction - they are inputs, not conclusions:
 
 - `utilization.gpu` 99-100%: a range is always resident while it executes.
 - `dmon mem` 8-15%: nothing is bandwidth-bound.
-- power flat at 18.8 W in both the copy and the compute phase (CALIBRATION 1f): the two phases do
-  not differ because both are dominated by the same starvation.
+- power flat at 18.8 W in both the copy and the compute phase (CALIBRATION 1f).
 - the SM clock held at 1395 MHz: not throttling.
+
+What they now have to be explained by is different, and harder: the device is busy executing, and
+drawing 18.8 W of 50 W while it does so. That is the open question, not a solved one.
 
 It also explains why the overlap question kept coming out flat. Serial 81.36 against overlapped
 82.49 t/s (section 4.2) held the barrier constant, so both were starved equally. Overlapping the
@@ -114,9 +134,11 @@ copy cannot help while a 3855 ms barrier stall dominates a 12.5 s ubatch.
   emits garbage (`far of UBL中心主任age.sinuj足Y`, recorded in section 6.3).
 - 115-117 t/s is therefore an **upper bound**: it is the speed of a broken pipeline. The real
   target is to reach it while keeping the ordering.
-- The mechanism by which a host block becomes GPU idle time is not measured directly here. The
-  inference is that the host cannot submit the next range while blocked, and the eval callback
-  adds to that window. The interleaved callback logging would separate the two.
+- The measured interval is **device execution**, so the barrier is not converting host block time
+  into GPU idle time. The 3838 ms it costs at `-ngl 1` is the blocking copy's serialization: in
+  the serial window the copy cannot overlap the compute while the barrier is obeyed, and 3838 ms
+  is 103% of the 3713 ms copy. The two-slot window already runs the copy asynchronously, which is
+  why overlap alone bought only 1.4% there.
 
 ## 6. Method notes
 

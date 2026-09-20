@@ -1656,18 +1656,39 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // That makes it a correctness barrier, so the useful question is not whether it can be dropped
 // but how much of the ubatch it accounts for. These counters answer that.
 struct ggml_backend_sched_sync_audit {
-    int64_t n_sync     = 0;  // timed synchronize calls
-    int64_t sync_us    = 0;  // their total wall time
-    int64_t n_range    = 0;  // graph ranges submitted on the callback path
-    int64_t n_callback = 0;  // callback_eval invocations
+    int64_t n_sync      = 0;  // timed synchronize calls
+    int64_t sync_us     = 0;  // their total wall time
+    int64_t sync_max_us = 0;  // the longest single one
+    int64_t n_sync_slow = 0;  // how many exceeded 50 ms: a few giants vs many small ones
+    int64_t n_trans     = 0;  // split-transition synchronizes (a second blocking site)
+    int64_t trans_us    = 0;
+    int64_t n_range     = 0;  // graph ranges submitted on the callback path
+    int64_t n_callback  = 0;  // callback_eval invocations
+    int64_t n_nodes     = 0;  // nodes submitted across all ranges
+    int64_t max_nodes   = 0;  // the largest single range, in nodes
+    // the range's own elapsed GPU time, measured with events. ggml_backend_event_record is
+    // cudaEventRecord and ggml_backend_event_synchronize is cudaEventSynchronize, so this is
+    // "how long the GPU took to reach the end of the range", independent of CPU-side stream
+    // bookkeeping. if this is well below sync_us then the synchronize cost is not GPU execution.
+    int64_t n_event     = 0;
+    int64_t event_us    = 0;
+    int64_t event_max_us = 0;
 };
 
 static ggml_backend_sched_sync_audit g_sched_sync_audit;
 
 void ggml_backend_sched_sync_audit_dump(void) {
-    GGML_LOG_INFO("%s: per-split synchronize %lld calls, %.3f ms total, %lld ranges, %lld callbacks\n",
+    GGML_LOG_INFO("%s: per-split synchronize %lld calls, %.3f ms total, max %.3f ms, %lld over 50 ms\n",
             __func__, (long long) g_sched_sync_audit.n_sync, g_sched_sync_audit.sync_us/1000.0,
-            (long long) g_sched_sync_audit.n_range, (long long) g_sched_sync_audit.n_callback);
+            g_sched_sync_audit.sync_max_us/1000.0, (long long) g_sched_sync_audit.n_sync_slow);
+    GGML_LOG_INFO("%s:   EVENT-measured range GPU time %lld ranges, %.3f ms total, max %.3f ms\n",
+            __func__, (long long) g_sched_sync_audit.n_event, g_sched_sync_audit.event_us/1000.0,
+            g_sched_sync_audit.event_max_us/1000.0);
+    GGML_LOG_INFO("%s:   split-transition sync %lld calls, %.3f ms total\n",
+            __func__, (long long) g_sched_sync_audit.n_trans, g_sched_sync_audit.trans_us/1000.0);
+    GGML_LOG_INFO("%s:   %lld ranges, %lld nodes submitted, max %lld nodes/range, %lld callbacks\n",
+            __func__, (long long) g_sched_sync_audit.n_range, (long long) g_sched_sync_audit.n_nodes,
+            (long long) g_sched_sync_audit.max_nodes, (long long) g_sched_sync_audit.n_callback);
     g_sched_sync_audit = {};
 }
 
@@ -1684,6 +1705,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // (the eval callback can refill storage the running range still reads), so dropping it
     // produces wrong results. it is used to measure how much of the ubatch it accounts for.
     const bool no_split_sync = getenv("LLAMA_SCHED_NO_SPLIT_SYNC") != nullptr;
+
+    // probe event used to ask the GPU how long a range really takes. created once and kept for
+    // the process lifetime: the function returns from several places and a leak would be worse
+    // than the small constant. nullptr means no backend here supports events, and then the probe
+    // is off. pick the first backend whose device can create events, not simply backends[0].
+    static ggml_backend_event_t ev_probe = nullptr;
+    static bool                ev_probe_tried = false;
+    if (sync_audit && !ev_probe_tried) {
+        ev_probe_tried = true;
+        for (int i = 0; i < sched->n_backends && ev_probe == nullptr; i++) {
+            if (sched->backends[i]->device != nullptr &&
+                sched->backends[i]->device->iface.event_new != nullptr) {
+                ev_probe = ggml_backend_event_new(sched->backends[i]->device);
+            }
+        }
+    }
+
     auto sync_timed = [&](ggml_backend_t b) {
         if (no_split_sync) {
             return;
@@ -1694,8 +1732,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         const int64_t t0 = ggml_time_us();
         ggml_backend_synchronize(b);
+        const int64_t dt = ggml_time_us() - t0;
         g_sched_sync_audit.n_sync++;
-        g_sched_sync_audit.sync_us += ggml_time_us() - t0;
+        g_sched_sync_audit.sync_us += dt;
+        if (dt > g_sched_sync_audit.sync_max_us) {
+            g_sched_sync_audit.sync_max_us = dt;
+        }
+        if (dt > 50000) {
+            g_sched_sync_audit.n_sync_slow++;
+        }
     };
 
     int prev_backend_id = -1;
@@ -1711,7 +1756,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                // a second blocking site, distinct from the per-range one: this fires once per
+                // split boundary, so it scales with n_splits (242 at -ngl 1, 2 at -ngl 99)
+                if (sync_audit) {
+                    const int64_t t0 = ggml_time_us();
+                    ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                    g_sched_sync_audit.n_trans++;
+                    g_sched_sync_audit.trans_us += ggml_time_us() - t0;
+                } else {
+                    ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                }
             }
         }
 
@@ -1862,13 +1916,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                // the callback seeds one refill per layer and the barrier is per range, so if a
+                // range submits far more nodes at one -ngl than another, the stall it causes is
+                // covering a proportionally larger amount of GPU work.
+                if (sync_audit) {
+                    g_sched_sync_audit.n_range++;
+                    g_sched_sync_audit.n_nodes += gv.n_nodes;
+                    if (gv.n_nodes > g_sched_sync_audit.max_nodes) {
+                        g_sched_sync_audit.max_nodes = gv.n_nodes;
+                    }
+                }
+
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
+                // ask the GPU directly how long the range takes, before any CPU-side bookkeeping.
+                // only the CUDA-like backends implement event_record; CPU and CUDA_Host do not,
+                // and ggml_backend_event_record asserts on that.
+                if (sync_audit && ev_probe != nullptr && split_backend->iface.event_record != nullptr) {
+                    ggml_backend_event_record(ev_probe, split_backend);
+                    const int64_t te0 = ggml_time_us();
+                    ggml_backend_event_synchronize(ev_probe);
+                    const int64_t det = ggml_time_us() - te0;
+                    g_sched_sync_audit.n_event++;
+                    g_sched_sync_audit.event_us += det;
+                    if (det > g_sched_sync_audit.event_max_us) {
+                        g_sched_sync_audit.event_max_us = det;
+                    }
+                }
+
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                if (sync_audit) { g_sched_sync_audit.n_range++; }
                 sync_timed(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
