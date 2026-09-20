@@ -187,16 +187,16 @@ pp1024, `-ngl 1 -ncmoe 99 -lm none -r 3`, build `27543a7ae` + instrumentation:
 | copy + compute | 9784 - 9790 ms of a 12575 - 12582 ms ubatch |
 | result | **81.36 +- 0.06 t/s** |
 
-The copy moves 1022.41 MiB per layer in 80.9 ms, i.e. **12.35 GB/s, which is 99% of the
-12.4-12.5 GB/s a pinned H2D copy reaches on this link.** The same transfer with no compute at all
-takes 81.7 ms (`tmp/prof/powmeas.cu`, 996 MiB). The copy phase is at the hardware limit and nothing
-the GPU is doing delays it.
+The copy moves 1022.41 MiB per layer in 80.9 ms, i.e. **12.35 GB/s, against the 12.4 GB/s this
+link delivers (section 5) - 99.6% of it.** The copy phase is at the hardware limit and nothing the
+GPU does delays it. The rate also matches the independent synthetic in `CALIBRATION.md` section 1f
+(12.5 GB/s, 16.1 W, 1.26 J/GiB), and it is token-count independent: see below.
 
 Two consequences:
 
 - **The overlapped pipeline is already doing its job.** Serial 81.36 against overlapped 82.49
 t/s is a 1.4% difference, so the overlap buys almost nothing: the copy fits inside the compute
-time already. The ceiling is therefore not the copy, and the 3x interference law (6.2) is not
+  time already. The ceiling is therefore not the copy, and the interference law (6.2) is not
 what limits the current config.
 - **The copy is token-count independent and the compute scales.** The same 48 layer transfers take
   3733.6 ms at p512 and 3720.1 ms at p1024 (0.4% apart), while the compute goes 2898.8 ms ->
@@ -297,11 +297,40 @@ Measured 12.4 GB/s, which is **99% of the 12.5 GB/s 128b/130b Gen3 x16 ceiling**
 headroom left in the copy itself. 48 layers x 1022 MiB = 48 GiB per ubatch = 4.07 s at 12.4 GB/s,
 against kernels at roughly 4.9 s. The only lever left is hiding the copy, not speeding it up.
 
-### 6.2 The 3x interference law
+### 6.2 Overlapping the copy buys nothing, and the 3x interference law overstates the damage
 
-Serialized copy costs 1x. Concurrent copy costs 3x: 1x for the transfer plus 2x in damage to the
-concurrent compute. The extra does not scale with token count, it scales with the copy. This is
-why "just overlap them" does not work here.
+The recorded law (`results/archive/retired_docs/FINDINGS_the_cliff.md`) says serialized copy costs
+1x while concurrent copy costs 3x - 1x of transfer plus 2x of damage to the concurrent compute. It
+comes from this table:
+
+| case | "compute" | copy | sum | actual | extra | extra/copy |
+|---|---:|---:|---:|---:|---:|---:|
+| p512 reused graph | 4163 ms | 3727 ms | 7890 ms | 7947 ms | 57 ms | 0.01 |
+| p512 new graph | 4170 ms | 3717 ms | 7887 ms | 15382 ms | 7495 ms | **2.02** |
+
+The "compute" column is from **NOCOPY**, and section 7 establishes why that is not a compute
+baseline: NOCOPY zero-fills the slots and never refills them, so the kernel reads 55.7 MB instead
+of 220 MB in 11.3 ms instead of 69 ms. The ratio therefore divides a real observation (the
+new-graph path genuinely costs +7.5 s) by a compute figure that is roughly 6x too small.
+
+The serial mode replaces both columns with direct measurements. p1024, `-ngl 1`, 46 layers:
+
+| quantity | value |
+|---|---:|
+| true compute | 6066 ms (131.9 ms/layer) |
+| blocking copy | 3720 ms (80.9 ms/layer) |
+| sum | 9786 ms |
+| overlapped ubatch, actual | 12575 ms |
+| extra | 2789 ms |
+| **extra / copy** | **0.75** |
+
+So the interference is **0.75x of the copy, not 2x**, and at the level that matters the two modes
+are equivalent: serial 81.36 t/s against overlapped 82.49 t/s. **The overlap is worth 1.4% of
+throughput.** That is not because overlapping is harmful; it is because the copy already fits
+inside the compute time.
+
+This correction does **not** touch the pp2048 cliff (6.8), which is real and is about the
+new-graph path, not about overlap.
 
 ### 6.3 The split sync is a correctness barrier, not a scheduling artifact
 
@@ -512,6 +541,11 @@ attention is itself the expensive part.
   The `-ngl 99` configuration does not fit on this card (section 7) and those runs died at
   context creation. The comparison has to be made with the serial 1-slot mode, where it does
   fit, and there it shows a 9.6% difference in favour of `-ngl 1` (81.36 vs 74.52).
+- **"Overlapping the copy costs 3x"** (archive: `FINDINGS_the_cliff.md`) - corrected in 6.2. The
+  ratio used a NOCOPY compute column, so it divided a real observation by a compute figure about
+  6x too small. The directly measured interference is **0.75x of the copy**, and the overlap is
+  worth 1.4% of throughput (82.49 overlapped vs 81.36 serial). The underlying observation the law
+  was derived from - the new-graph path costs +7.5 s - is real and survives as 6.8.
 
 ---
 
