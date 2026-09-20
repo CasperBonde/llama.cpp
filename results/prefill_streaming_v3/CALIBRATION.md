@@ -235,11 +235,12 @@ per-layer round trip (~90-130 ms). The trace therefore shows flat plateaus (18.1
 never resolved as a separate level. So:
 
 - the copy/compute split (the 62 J subtraction above) is a subtraction, not a direct observation
-- no per-layer periodicity is recoverable at this rate; measured autocorrelation is ~0 at lag 46
+- the per-layer cycle is not visible by inspection; measured autocorrelation is ~0 at lag 46
   samples (263 ms), and 1.2 W of variation from a 1100 J compute phase is under the noise floor
 
 What power *can* tell us at this rate is the thing that matters: the total is far too low for the
-work being claimed.
+work being claimed. The subsections below recover the split anyway, by averaging over thousands of
+cycles instead of trying to see one cycle.
 
 ### Resolution: separate the phases by *folding*, not by polling faster
 
