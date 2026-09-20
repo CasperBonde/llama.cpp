@@ -271,6 +271,14 @@ private:
     void prefill_streaming_free();
     bool prefill_streaming_fill_slot(int slot, int il, bool async);
     void prefill_streaming_wait_slot(int slot, int il) const;
+    void prefill_streaming_sync_slot(int slot) const;
+    void prefill_streaming_audit_syncs(const char * where) const;
+
+    // which slot holds layer il. two slots rotate in the default pipeline; the serial mode
+    // keeps every layer in slot 0, so this must never be written as `il % 2` at a call site.
+    int prefill_streaming_slot_index(int il) const {
+        return prefill_streaming_serial ? 0 : (il % 2);
+    }
     ggml_tensor * prefill_streaming_bind(ggml_context * ctx, ggml_tensor * tensor, int il) const;
     bool prefill_streaming_sync_cb(ggml_tensor * t, bool ask);
     static bool prefill_streaming_sync_cb_trampoline(ggml_tensor * t, bool ask, void * user_data);
@@ -377,7 +385,16 @@ private:
     int    prefill_streaming_cur_layer = -1; // layer currently computing, -1 if none
     size_t prefill_streaming_n_fill = 0;     // number of slot refills, for diagnostics
     size_t prefill_streaming_n_split = 0;    // number of layer-boundary splits, for diagnostics
+    bool   prefill_streaming_new_graph = false; // true when this ubatch built a new graph
+    std::vector<int64_t> prefill_streaming_layer_times; // host time at each layer boundary
+    int64_t prefill_streaming_wait_us = 0;        // host time inside the ask branch (wait for prefetch)
+    int64_t prefill_streaming_host_us = 0;        // host time in the scheduler between ranges
+    int64_t prefill_streaming_work_us = 0;        // compute + backend synchronize at each boundary
+    int64_t prefill_streaming_host_prev_us = 0;   // timestamp of the previous !ask callback
+    int64_t prefill_streaming_ask_us = 0;         // timestamp of the end of the last ask callback
+    int64_t prefill_streaming_cb_us = 0;          // total host time inside the eval callback
     int64_t prefill_streaming_fill_us = 0;   // time spent refilling slots, for diagnostics
+    int64_t prefill_streaming_copy_wall_us = 0; // blocking time of the refill copies, diagnostics
     size_t prefill_streaming_fill_bytes = 0; // bytes copied into slots, for diagnostics
     std::vector<prefill_streaming_slot> prefill_streaming_slots;
     // [layer][tensor index] -> { source tensor, offset in slot }
@@ -386,6 +403,19 @@ private:
     ggml_backend_t prefill_streaming_backend = nullptr;      // device that owns the slots
     ggml_backend_ptr prefill_streaming_copy_backend;         // separate stream used for prefetch copies
     std::vector<ggml_backend_event_t> prefill_streaming_slot_done; // per slot: copy has landed
+
+    // LLAMA_PREFILL_STREAMING_SERIAL: debug mode that serializes copy and compute inside the
+    // ubatch, so each layer's compute runs on a GPU with nothing else in flight. it cannot
+    // overlap by construction, so it is never fast: it exists to give a clean measurement
+    // window, and it needs one slot instead of two.
+    bool   prefill_streaming_serial      = false; // serial mode requested
+    int    prefill_streaming_serial_hold = -1;    // layer currently in the single slot, -1 if none
+    int64_t prefill_streaming_serial_ask_us = 0;  // timestamp of the last ask (start of compute)
+    size_t  prefill_streaming_n_refill_sync = 0;  // refills that waited for the copy
+    // per-layer phases of the serial mode, microseconds
+    std::vector<int64_t> prefill_streaming_serial_refill_us;
+    std::vector<int64_t> prefill_streaming_serial_compute_us;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 

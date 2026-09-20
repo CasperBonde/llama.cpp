@@ -130,10 +130,17 @@ bool llama_context::prefill_streaming_init() {
 
     slot_size = GGML_PAD(slot_size, alignment);
 
-    prefill_streaming_slots.clear();
-    prefill_streaming_slots.resize(2);
+    prefill_streaming_serial = getenv("LLAMA_PREFILL_STREAMING_SERIAL") != nullptr;
 
-    for (int s = 0; s < 2; ++s) {
+    // in serial mode every layer round-trips through one slot, because the two-slot rotation
+    // cannot hold layer il and il+1 at once while also keeping the copy strictly off the compute
+    // stream. one slot is also the smaller VRAM footprint, which matters at high -ngl.
+    const int n_slot = prefill_streaming_serial ? 1 : 2;
+
+    prefill_streaming_slots.clear();
+    prefill_streaming_slots.resize(n_slot);
+
+    for (int s = 0; s < n_slot; ++s) {
         auto & slot = prefill_streaming_slots[s];
 
         slot.buffer.reset(ggml_backend_buft_alloc_buffer(buft, slot_size));
@@ -148,7 +155,8 @@ bool llama_context::prefill_streaming_init() {
             ggml_backend_buffer_set_usage(slot.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
-        // quantized weights are zero-filled so a slot that is not yet valid cannot produce NaNs
+        // zero fill only what the buffer actually holds: the clear is a full size memset on the
+        // host, which is one pass over 1022 MiB per slot and is pure setup cost
         ggml_backend_buffer_clear(slot.buffer.get(), 0);
 
         ggml_init_params params = {
@@ -201,24 +209,27 @@ bool llama_context::prefill_streaming_init() {
     }
 
     // a second backend instance for the same device gives us a stream that is independent of
-    // the compute stream, which is what makes the prefetch overlap with compute
-    ggml_backend_t copy_backend = nullptr;
-    {
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        if (dev != nullptr) {
-            copy_backend = ggml_backend_dev_init(dev, nullptr);
+    // the compute stream, which is what makes the prefetch overlap with compute. the serial
+    // mode does not overlap, so it does not need the extra stream.
+    if (!prefill_streaming_serial) {
+        ggml_backend_t copy_backend = nullptr;
+        {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev != nullptr) {
+                copy_backend = ggml_backend_dev_init(dev, nullptr);
+            }
         }
+        if (copy_backend == nullptr) {
+            LLAMA_LOG_WARN("%s: could not create a copy stream, streaming unavailable\n", __func__);
+            prefill_streaming_free();
+            return false;
+        }
+        prefill_streaming_copy_backend.reset(copy_backend);
     }
-    if (copy_backend == nullptr) {
-        LLAMA_LOG_WARN("%s: could not create a copy stream, streaming unavailable\n", __func__);
-        prefill_streaming_free();
-        return false;
-    }
-    prefill_streaming_copy_backend.reset(copy_backend);
 
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    prefill_streaming_slot_done.assign(2, nullptr);
-    for (int s = 0; s < 2; ++s) {
+    prefill_streaming_slot_done.assign(n_slot, nullptr);
+    for (int s = 0; s < n_slot; ++s) {
         prefill_streaming_slot_done[s] = ggml_backend_event_new(dev);
         if (prefill_streaming_slot_done[s] == nullptr) {
             LLAMA_LOG_WARN("%s: could not create slot event %d\n", __func__, s);
@@ -234,8 +245,9 @@ bool llama_context::prefill_streaming_init() {
     prefill_streaming_n_fill    = 0;
     prefill_streaming_backend   = backend;
 
-    LLAMA_LOG_INFO("%s: prefill streaming enabled, 2 slots of %.2f MiB, %d layers, %zu tensors\n",
-            __func__, slot_size/(1024.0*1024.0), n_layer, n_tensors);
+    LLAMA_LOG_INFO("%s: prefill streaming enabled, %d slot%s of %.2f MiB, %d layers, %zu tensors%s\n",
+            __func__, n_slot, n_slot == 1 ? "" : "s", slot_size/(1024.0*1024.0), n_layer, n_tensors,
+            prefill_streaming_serial ? ", serial copy/compute" : "");
 
     return true;
 }
@@ -261,10 +273,17 @@ void llama_context::prefill_streaming_free() {
 }
 
 bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
-    if (slot < 0 || slot >= (int) prefill_streaming_slots.size()) {
+    if (il < 0 || il >= (int) prefill_streaming_maps.size()) {
         return false;
     }
-    if (il < 0 || il >= (int) prefill_streaming_maps.size()) {
+
+    // the serial mode holds every layer in the same slot, so the caller's slot number is
+    // only an index into the two-slot arrangement and has to be overridden here
+    if (prefill_streaming_serial) {
+        slot = 0;
+    }
+
+    if (slot < 0 || slot >= (int) prefill_streaming_slots.size()) {
         return false;
     }
 
@@ -328,6 +347,15 @@ bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
     if (async) {
         // record that this slot now holds layer il once the copy stream drains
         ggml_backend_event_record(prefill_streaming_slot_done[slot], prefill_streaming_copy_backend.get());
+
+        // LLAMA_PREFILL_STREAMING_TIMECOPY: block until the copy landed and add the wall time
+        // to the total. if the copy really runs concurrently with compute this returns almost
+        // at once and does not change the total; if it returns late the copy is the bottleneck.
+        static const bool time_copy = getenv("LLAMA_PREFILL_STREAMING_TIMECOPY") != nullptr;
+        if (time_copy) {
+            ggml_backend_synchronize(prefill_streaming_copy_backend.get());
+            prefill_streaming_copy_wall_us += ggml_time_us() - t_fill_start;
+        }
     }
 
     prefill_streaming_fill_us    += ggml_time_us() - t_fill_start;
@@ -338,6 +366,18 @@ bool llama_context::prefill_streaming_fill_slot(int slot, int il, bool async) {
 }
 
 void llama_context::prefill_streaming_wait_slot(int slot, int il) const {
+    // In the serial mode the slot is refilled one layer ahead and has to be waited on before
+    // that layer computes, so there is no seed to skip. Waiting here blocks the host until the
+    // copy has landed, which is exactly the "serialize copy and compute" behaviour: layer il-1
+    // computes while the copy of layer il is in flight, and the host blocks at this call when
+    // the copy has not kept up. The copy for layer il still overlapped the compute of layer il-1;
+    // what is gone is any copy in flight *during* the compute of layer il, which is what makes
+    // this a clean window for measuring the compute on its own.
+    if (prefill_streaming_serial) {
+        // every fill in the serial mode is blocking, so there is never anything to wait for
+        return;
+    }
+
     if (slot < 0 || slot >= (int) prefill_streaming_slot_done.size()) {
         return;
     }
@@ -351,8 +391,71 @@ void llama_context::prefill_streaming_wait_slot(int slot, int il) const {
         return;
     }
 
+    // LLAMA_PREFILL_STREAMING_NOWAIT: do not wait for the prefetch at all. the output is
+    // wrong unless the copy already landed. used to separate "the compute stream stalls on
+    // the copy" from "the copy itself is slow".
+    static const bool no_wait = getenv("LLAMA_PREFILL_STREAMING_NOWAIT") != nullptr;
+    if (no_wait) {
+        return;
+    }
+
     // make the compute stream wait for the prefetch instead of blocking the host
     ggml_backend_event_wait(prefill_streaming_backend, prefill_streaming_slot_done[slot]);
+}
+
+// Block until the copy issued for this slot has landed.
+//
+// ggml_backend_synchronize is a stream synchronize, not a device synchronize, so this waits
+// for the copy stream only and never for the compute stream. That matters: it is the property
+// the clean-window argument depends on.
+void llama_context::prefill_streaming_sync_slot(int slot) const {
+    if (slot < 0 || slot >= (int) prefill_streaming_slot_done.size()) {
+        return;
+    }
+    if (prefill_streaming_slot_done[slot] != nullptr) {
+        ggml_backend_event_synchronize(prefill_streaming_slot_done[slot]);
+    }
+}
+
+// Audit every path from the llama.cpp side that can make the host wait for the GPU.
+//
+// This exists because a hidden CPU-wide wait anywhere in the loop is the leading candidate for
+// why the compute phases draw less power than a spin loop that moves no bytes. It enumerates
+// the candidate call sites instead of assuming them, so the answer is an observation rather
+// than a reading of the code.
+//
+// Covered: the mutex- or graph-level synchronize, the refill path, and the split sync in
+// ggml_backend_sched_graph_compute_async. Not covered: driver-internal blocking, which needs
+// the LD_PRELOAD interposer in tmp/prof/syncspy.c.
+void llama_context::prefill_streaming_audit_syncs(const char * where) const {
+    static const bool audit = getenv("LLAMA_PREFILL_STREAMING_AUDIT") != nullptr;
+    if (!audit) {
+        return;
+    }
+
+    int64_t t = 0;
+    LLAMA_LOG_INFO("%s: sync audit at %s:\n", __func__, where);
+
+    if (prefill_streaming_copy_backend) {
+        t = ggml_time_us();
+        ggml_backend_synchronize(prefill_streaming_copy_backend.get());
+        LLAMA_LOG_INFO("%s:   copy backend synchronize: %.3f ms\n", __func__,
+                (ggml_time_us() - t)/1000.0);
+    }
+    if (prefill_streaming_backend) {
+        t = ggml_time_us();
+        ggml_backend_synchronize(prefill_streaming_backend);
+        LLAMA_LOG_INFO("%s:   slot backend synchronize: %.3f ms\n", __func__,
+                (ggml_time_us() - t)/1000.0);
+    }
+    t = ggml_time_us();
+    ggml_backend_sched_synchronize(sched.get());
+    LLAMA_LOG_INFO("%s:   sched synchronize: %.3f ms\n", __func__,
+            (ggml_time_us() - t)/1000.0);
+    t = ggml_time_us();
+    ggml_backend_synchronize(backend_cpu);
+    LLAMA_LOG_INFO("%s:   cpu backend synchronize: %.3f ms\n", __func__,
+            (ggml_time_us() - t)/1000.0);
 }
 
 // bind a layer weight tensor to its slot-backed counterpart. returns the input unchanged
@@ -370,10 +473,10 @@ ggml_tensor * llama_context::prefill_streaming_bind(ggml_context * ctx, ggml_ten
     const auto & mapping = prefill_streaming_maps[il];
     for (size_t i = 0; i < mapping.size(); ++i) {
         if (mapping[i].first == tensor) {
-            ggml_tensor * view = prefill_streaming_slots[il % 2].layers[il][i];
+            ggml_tensor * view = prefill_streaming_slots[prefill_streaming_slot_index(il)].layers[il][i];
             if (il < 2 && !prefill_streaming_bind_logged) {
                 LLAMA_LOG_DEBUG("%s: bound %s -> slot %d buffer %s\n", __func__,
-                        ggml_get_name(tensor), il % 2,
+                        ggml_get_name(tensor), prefill_streaming_slot_index(il),
                         ggml_backend_buffer_name(view->buffer));
             }
             return view;
@@ -415,7 +518,7 @@ void llama_context::prefill_streaming_rewrite_graph(ggml_cgraph * gf) const {
                         continue;
                     }
 
-                    ggml_tensor * view = prefill_streaming_slots[il % 2].layers[il][k];
+                    ggml_tensor * view = prefill_streaming_slots[prefill_streaming_slot_index((int) il)].layers[il][k];
                     if (debug && n_rewritten < 16) {
                         LLAMA_LOG_INFO("%s: %s src[%d] %s -> %s (layer %zu)\n", __func__,
                                 node->name, j, ggml_get_name(src), ggml_get_name(view), il);
@@ -442,6 +545,7 @@ void llama_context::prefill_streaming_rewrite_graph(ggml_cgraph * gf) const {
 // its own range and synchronize the backend afterwards. the following call with
 // ask == false is therefore the safe point to overwrite the other slot.
 bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
+    const int64_t t_cb_enter = ggml_time_us();
     if (!prefill_streaming_enabled) {
         return false;
     }
@@ -449,40 +553,110 @@ bool llama_context::prefill_streaming_sync_cb(ggml_tensor * t, bool ask) {
     // layer boundary nodes are named "l_out-<il>" by llm_graph_context::cb
     const char * name = ggml_get_name(t);
     if (name == nullptr || strncmp(name, "l_out-", 6) != 0) {
+        prefill_streaming_cb_us += ggml_time_us() - t_cb_enter;
         return false;
     }
 
     const int il = atoi(name + 6);
     if (il < 0 || il >= prefill_streaming_n_layer) {
+        prefill_streaming_cb_us += ggml_time_us() - t_cb_enter;
         return false;
     }
 
     if (ask) {
         // the range that is about to be submitted ends at this node, so it is the range
         // that reads layer il's weights. make the compute stream wait for the prefetch.
-        prefill_streaming_wait_slot(il % 2, il);
+        const int64_t t_ask = ggml_time_us();
+        prefill_streaming_wait_slot(prefill_streaming_slot_index(il), il);
+        prefill_streaming_wait_us += ggml_time_us() - t_ask;
+        prefill_streaming_ask_us   = ggml_time_us();
+        prefill_streaming_cb_us   += ggml_time_us() - t_cb_enter;
         prefill_streaming_n_split++;
+
+        // serial mode: the compute of layer il starts here, on the compute stream, with the
+        // copy already drained. stamp the start so the next !ask can measure the phase.
+        if (prefill_streaming_serial) {
+            prefill_streaming_serial_ask_us = prefill_streaming_ask_us;
+            prefill_streaming_serial_hold   = il;
+        }
         return true;
     }
 
     // layer il has finished computing and the backend was synchronized at the boundary.
     // its slot is now free and will next hold layer il + 2.
+    {
+        // the gaps after the ask callback are: the graph submit and the backend synchronize.
+        // the gaps after the previous !ask callback are: the range scan and the next ask call.
+        const int64_t t_now = ggml_time_us();
+        prefill_streaming_work_us += t_now - prefill_streaming_ask_us;
+        if (prefill_streaming_host_prev_us > 0) {
+            prefill_streaming_host_us += prefill_streaming_ask_us - prefill_streaming_host_prev_us;
+        }
+        prefill_streaming_host_prev_us = t_now;
+    }
+
+    // serial mode: the compute of layer il bracketed by this callback is now complete and
+    // nothing else is in flight. two things are worth recording here.
+    //
+    //   1. the wall time of the layer's compute. work_us above is this plus the graph submit,
+    //      so the difference between the two is the submit cost.
+    //   2. how long the copy of the next layer takes to land once we block on it. the copy was
+    //      issued during this layer's compute, so this is the part the compute failed to cover.
+    //      if it is near zero the copy kept up; if it is a full copy time the copy is the
+    //      bottleneck. ggml_backend_synchronize is stream-scoped, so waiting here cannot also
+    //      be waiting for compute.
+    int64_t serial_compute_us = 0;
+    if (prefill_streaming_serial && prefill_streaming_serial_ask_us > 0) {
+        serial_compute_us = ggml_time_us() - prefill_streaming_serial_ask_us;
+    }
+
     prefill_streaming_cur_layer = il;
+    prefill_streaming_layer_times.push_back(ggml_time_us());
 
     const int next = il + 2;
     if (next >= prefill_streaming_n_layer) {
         return true;
     }
 
+    const int slot = prefill_streaming_slot_index(next);
+
+    if (prefill_streaming_serial) {
+        // serial mode: one slot, filled by a blocking copy. this interval is exactly the copy of
+        // layer `next`, and the compute of layer il was measured above, so one layer is:
+        //
+        //     refill(layer next) ; compute(layer next) ; refill(layer next + 2) ; ...
+        //
+        // the copy is here on purpose, not on the copy stream: the serial mode waits for it
+        // before the layer computes anyway, so putting it after the previous layer's compute
+        // makes the refill phase a clean, directly measured interval.
+        const int64_t t_fill = ggml_time_us();
+        if (!prefill_streaming_fill_slot(slot, next, false)) {
+            LLAMA_LOG_ERROR("%s: failed to fill slot for layer %d\n", __func__, next);
+            prefill_streaming_failed = true;
+            prefill_streaming_cb_us += ggml_time_us() - t_cb_enter;
+            return false;
+        }
+        const int64_t serial_refill_us = ggml_time_us() - t_fill;
+
+        prefill_streaming_serial_hold = next;
+        prefill_streaming_serial_compute_us.push_back(serial_compute_us);
+        prefill_streaming_serial_refill_us.push_back(serial_refill_us);
+        prefill_streaming_n_refill_sync++;
+
+        prefill_streaming_cb_us += ggml_time_us() - t_cb_enter;
+        return true;
+    }
+
     // issue the copy on the copy stream. this only enqueues, it does not wait, so the
     // compute stream keeps running the next layer while the copy is in flight.
-    const int slot = next % 2;
     if (!prefill_streaming_fill_slot(slot, next, true)) {
         LLAMA_LOG_ERROR("%s: failed to fill slot for layer %d\n", __func__, next);
         prefill_streaming_failed = true;
+        prefill_streaming_cb_us += ggml_time_us() - t_cb_enter;
         return false;
     }
 
+    prefill_streaming_cb_us += ggml_time_us() - t_cb_enter;
     return true;
 }
 
@@ -516,6 +690,13 @@ void llama_context::prefill_streaming_check_placement(ggml_cgraph * gf) {
     std::string cpu_op;
     std::string off_device_op;
 
+    // count the ops that still read the ORIGINAL host weights of a streamed layer. those are
+    // the tensors the slots are supposed to replace, so an op that reads one makes the
+    // scheduler stage that weight again instead of reading the slot.
+    int         n_orig_ops  = 0;
+    std::string orig_op;
+    size_t      orig_bytes  = 0;
+
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
 
@@ -528,6 +709,30 @@ void llama_context::prefill_streaming_check_placement(ggml_cgraph * gf) {
             for (const auto & slot : prefill_streaming_slots) {
                 if (slot.buffer && src->buffer == slot.buffer.get()) {
                     uses_slot = true;
+                    break;
+                }
+            }
+        }
+
+        // an op that still reads a mapped SOURCE tensor pulls the weight from its host
+        // buffer instead of the slot. the rewrite is supposed to remove all of these.
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            for (const auto & mapping : prefill_streaming_maps) {
+                bool hit = false;
+                for (const auto & entry : mapping) {
+                    if (entry.first == src) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) {
+                    n_orig_ops++;
+                    orig_bytes += ggml_nbytes(src);
+                    if (orig_op.empty()) { orig_op = node->name; }
                     break;
                 }
             }
@@ -562,6 +767,9 @@ void llama_context::prefill_streaming_check_placement(ggml_cgraph * gf) {
     LLAMA_LOG_INFO("%s: %d graph ops read slot tensors, %d of them scheduled on the CPU, slot device: %s\n",
             __func__, n_slot_ops, n_slot_ops_cpu,
             slot_backend ? ggml_backend_name(slot_backend) : "(unresolved)");
+
+    LLAMA_LOG_INFO("%s: %d ops still read an ORIGINAL streamed tensor (%zu MiB, first: %s)\n",
+            __func__, n_orig_ops, orig_bytes/(1024*1024), n_orig_ops > 0 ? orig_op.c_str() : "-");
 
     if (n_slot_ops_cpu > 0) {
         LLAMA_LOG_WARN("%s: %d of %d slot consumers run on the CPU (first: %s), "
@@ -1895,6 +2103,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    prefill_streaming_new_graph = false;
+
+    // reset the per-ubatch diagnostics on every path, so reused ubatches do not report the
+    // counters accumulated by the previous ubatch
+    prefill_streaming_layer_times.clear();
+    prefill_streaming_wait_us       = 0;
+    prefill_streaming_host_us       = 0;
+    prefill_streaming_work_us       = 0;
+    prefill_streaming_host_prev_us  = 0;
+    prefill_streaming_ask_us        = 0;
+    prefill_streaming_cb_us         = 0;
+    prefill_streaming_fill_us       = 0;
+    prefill_streaming_fill_bytes    = 0;
+    prefill_streaming_copy_wall_us  = 0;
+    prefill_streaming_n_fill        = 0;
+    prefill_streaming_n_split       = 0;
+    prefill_streaming_n_refill_sync = 0;
+    prefill_streaming_serial_hold   = -1;
+    prefill_streaming_serial_ask_us = 0;
+    prefill_streaming_serial_refill_us.clear();
+    prefill_streaming_serial_compute_us.clear();
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1914,24 +2144,52 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        // experimental prefill streaming: seed the two slots with the first two layers
-        // and install the refill callback. the graph binds layer weights to the slots.
+        // experimental prefill streaming: seed the first layers and install the refill
+        // callback. the graph binds layer weights to the slots.
+        //
+        // a layer already resident on the compute device does not need a slot at all: the
+        // graph can read its weights where they are. -ngl 99 puts every layer there, which
+        // would otherwise leave the slots empty, the callback never firing and no streaming
+        // at all. seed the first resident layer instead so -ngl 99 is a real control run
+        // (slots and the refill machinery active, but no PCIe traffic to separate).
         if (prefill_streaming_enabled && ubatch.n_tokens > 1) {
-            LLAMA_LOG_DEBUG("%s: prefill streaming ubatch of %d tokens, %zu refills so far\n",
-                    __func__, ubatch.n_tokens, prefill_streaming_n_fill);
-            prefill_streaming_fill_us    = 0;
-            prefill_streaming_fill_bytes = 0;
-            prefill_streaming_n_fill     = 0;
-            prefill_streaming_n_split    = 0;
-            if (!prefill_streaming_fill_slot(0, 0, false) ||
-                (prefill_streaming_n_layer > 1 && !prefill_streaming_fill_slot(1, 1, false))) {
-                LLAMA_LOG_ERROR("%s: failed to seed prefill streaming slots\n", __func__);
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
+            int seed0 = -1;
+            int seed1 = -1;
+            for (int il = 0; il < prefill_streaming_n_layer; ++il) {
+                if (prefill_streaming_maps[il].empty()) {
+                    continue;   // nothing host resident, nothing to stream for this layer
+                }
+                if (seed0 < 0) {
+                    seed0 = il;
+                } else {
+                    seed1 = il;
+                    break;
+                }
             }
 
-            ggml_backend_sched_set_eval_callback(sched.get(),
-                    prefill_streaming_sync_cb_trampoline, this);
+            LLAMA_LOG_DEBUG("%s: prefill streaming ubatch of %d tokens, %zu refills so far\n",
+                    __func__, ubatch.n_tokens, prefill_streaming_n_fill);
+
+            if (seed0 < 0) {
+                LLAMA_LOG_INFO("%s: no host resident layer weight, streaming has nothing to do\n",
+                        __func__);
+            } else {
+                prefill_streaming_new_graph = true;
+
+                // the serial mode has one slot, so a second seed would overwrite the first
+                // before it was ever computed
+                const bool seed_two = !prefill_streaming_serial && seed1 >= 0;
+
+                if (!prefill_streaming_fill_slot(0, seed0, false) ||
+                    (seed_two && !prefill_streaming_fill_slot(1, seed1, false))) {
+                    LLAMA_LOG_ERROR("%s: failed to seed prefill streaming slots\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+
+                ggml_backend_sched_set_eval_callback(sched.get(),
+                        prefill_streaming_sync_cb_trampoline, this);
+            }
         }
 
         gf = model.build_graph(gparams);
@@ -1991,6 +2249,44 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LLAMA_PREFILL_STREAMING_AUDIT: ask every llama.cpp-side path that could block the host
+    // how long it currently blocks. a small number here means the host is not waiting, and the
+    // question becomes what the GPU is doing instead.
+    prefill_streaming_audit_syncs(__func__);
+
+    // LLAMA_PREFILL_STREAMING_SERIAL: the per-layer copy and compute phases of the serial mode.
+    // this is the clean window. the compute phase runs with the copy already drained and the
+    // previous layer finished, so a low-power reading inside it cannot be blamed on overlap.
+    if (prefill_streaming_serial && prefill_streaming_enabled && ubatch.n_tokens > 1) {
+        if (!prefill_streaming_serial_refill_us.empty()) {
+            int64_t refill_sum = 0, compute_sum = 0, refill_max = 0, compute_min = -1, compute_max = 0;
+            for (int64_t v : prefill_streaming_serial_refill_us) {
+                refill_sum += v;
+                if (v > refill_max) { refill_max = v; }
+            }
+            for (int64_t v : prefill_streaming_serial_compute_us) {
+                compute_sum += v;
+                if (compute_min < 0 || v < compute_min) { compute_min = v; }
+                if (v > compute_max) { compute_max = v; }
+            }
+            const size_t n = prefill_streaming_serial_refill_us.size();
+
+            LLAMA_LOG_INFO("%s: serial phases over %zu layers, %d slot%s: refill %.3f ms total (%.3f ms mean, %.3f ms max, %.2f GB/s), compute %.3f ms total (%.3f ms mean, %.3f-%.3f ms range)\n",
+                    __func__, n, (int) prefill_streaming_slots.size(),
+                    (int) prefill_streaming_slots.size() == 1 ? "" : "s",
+                    refill_sum/1000.0,  refill_sum/(double)n/1000.0,  refill_max/1000.0,
+                    refill_sum > 0 ? prefill_streaming_fill_bytes/(double)refill_sum/1000.0 : 0.0,
+                    compute_sum/1000.0, compute_sum/(double)n/1000.0,
+                    compute_min/1000.0, compute_max/1000.0);
+            LLAMA_LOG_INFO("%s: serial total: %.3f ms of the %.3f ms ubatch = %.1f%% copy-phase (%.2f GB/s), %.1f%% compute-phase\n",
+                    __func__,
+                    (refill_sum + compute_sum)/1000.0, t_compute_us/1000.0,
+                    100.0*refill_sum/(refill_sum + compute_sum),
+                    refill_sum > 0 ? prefill_streaming_fill_bytes/(double)refill_sum/1000.0 : 0.0,
+                    100.0*compute_sum/(refill_sum + compute_sum));
+        }
+    }
+
     // LLAMA_PREFILL_STREAMING_DEBUG: per-ubatch wall time, to see whether the first ubatch of
     // a batch behaves differently from the following ones.
     static const bool debug_streaming = getenv("LLAMA_PREFILL_STREAMING_DEBUG") != nullptr;
@@ -2004,10 +2300,37 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_synchronize(prefill_streaming_copy_backend.get());
             t_drain_us = ggml_time_us() - t_drain_start;
         }
-        LLAMA_LOG_INFO("%s: streaming ubatch of %d tokens: compute %.3f ms, slot fill enqueue %.3f ms, %zu refills, %zu layer splits, copy drain at end %.3f ms\n",
-                __func__, ubatch.n_tokens, t_compute_us/1000.0,
-                prefill_streaming_fill_us/1000.0, prefill_streaming_n_fill, prefill_streaming_n_split,
+        LLAMA_LOG_INFO("%s: streaming ubatch of %d tokens: %s graph, compute %.3f ms, slot fill enqueue %.3f ms, %zu refills, %.1f MiB copied (%.2f GB/s), %zu layer splits, copy drain at end %.3f ms\n",
+                __func__, ubatch.n_tokens, prefill_streaming_new_graph ? "new" : "reused",
+                t_compute_us/1000.0,
+                prefill_streaming_fill_us/1000.0, prefill_streaming_n_fill,
+                prefill_streaming_fill_bytes/(1024.0*1024.0),
+                prefill_streaming_fill_us > 0 ? prefill_streaming_fill_bytes/(double) prefill_streaming_fill_us/1000.0 : 0.0,
+                prefill_streaming_n_split,
                 t_drain_us/1000.0);
+
+        LLAMA_LOG_INFO("%s: breakdown: callback %.3f ms, wait_slot %.3f ms, scheduler host %.3f ms, submit+sync %.3f ms, blocking copy %.3f ms (total %.3f ms)\n",
+                __func__,
+                prefill_streaming_cb_us/1000.0,
+                prefill_streaming_wait_us/1000.0,
+                prefill_streaming_host_us/1000.0,
+                prefill_streaming_work_us/1000.0,
+                prefill_streaming_copy_wall_us/1000.0,
+                t_compute_us/1000.0);
+
+        // per-layer gap between the node boundaries. a few large gaps localize the extra time
+        // of a ubatch to specific layers; an even spread means it is paid at every layer.
+        if (!prefill_streaming_layer_times.empty()) {
+            std::string trace;
+            const int64_t t0 = prefill_streaming_layer_times.front();
+            int64_t t_prev = t0;
+            for (int64_t t : prefill_streaming_layer_times) {
+                trace += " " + std::to_string((t - t_prev)/1000);
+                t_prev = t;
+            }
+            LLAMA_LOG_INFO("%s: per-layer gaps ms (of %zu layers):%s\n",
+                    __func__, prefill_streaming_layer_times.size(), trace.c_str());
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
