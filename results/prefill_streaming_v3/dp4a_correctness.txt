@@ -1,0 +1,10 @@
+# dp4a vs tensor core vs CPU, greedy temp 0, ub 512 and 1024
+# model: models/Qwen3-Next-80B-A3B-Instruct-Q4_K_M.gguf
+# date: 2026-09-20T18:05:48+02:00
+# build: 87944efa6
+cpu|512|The capital of France is Paris.
+base|512|The capital of France is Paris.
+dp4a|512|The capital of France is Paris.
+cpu|1024|The capital of France is Paris.
+base|1024|The capital of France is Paris.
+dp4a|1024|The capital of France is Paris.
