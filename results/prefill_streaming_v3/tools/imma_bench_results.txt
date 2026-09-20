@@ -1,0 +1,14 @@
+Quadro T1000, sm_75, 14 SMs, grid 112 x block 256 = 28672 threads
+
+imma m8n8k16.s8.s8 x4  [128 MACs/iter/thread]
+  scaling: 2000:14.6761ms 8000:58.8534ms 32000:235.4845ms 128000:937.7874ms
+  50 launches x 8000 iters in 2930.5 ms -> 500.938 GMAC/s (16.0 W avg / 16.1 W max)
+
+dp4a (512 per iter)  [2048 MACs/iter/thread]
+  scaling: 2000:23.4595ms 8000:93.7718ms 32000:374.8787ms 128000:1498.8759ms
+  31 launches x 8000 iters in 2903.7 ms -> 5015.154 GMAC/s (25.4 W avg / 25.6 W max)
+
+ffma (1024 per iter)  [1024 MACs/iter/thread]
+  scaling: 2000:46.8564ms 8000:187.4816ms 32000:749.6827ms 128000:3002.6750ms
+  16 launches x 8000 iters in 3000.5 ms -> 1252.492 GMAC/s (24.1 W avg / 24.3 W max)
+

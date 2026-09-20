@@ -135,8 +135,8 @@ the kernel contains no `HMMA` at all, only `IMMA` plus `FFMA` dequant work.
 whether the driver runs the `IMMA` on the integer/FP32 datapath. If it is the latter, the build is
 selecting a tensor-core schedule and an `I=128, J=128, nthreads 256, 255-register` tile shape for
 hardware that cannot run it at rate. That would explain 255 registers, 25% occupancy and a kernel
-that is 1.42x slower than the same work split across CPU cores. One synthetic `HMMA` microbenchmark
-settles it.
+that is 1.42x slower than the same work split across CPU cores. **Answered in section 7: there is
+no tensor pipe, and the penalty is 10x.**
 
 ## 5. On `-ub 64`
 
@@ -153,7 +153,63 @@ tokens, more blocks and lower register pressure.
    fixup kernel). Print the actual `ntx, nty, ntzw, I, J` per MoE launch so the tiles are known
    rather than inferred, and so the `-ngl 1` against `-ngl 99` per-node difference can be tied to a
    specific launch shape.
-2. **Does TU117 have a usable IMMA tensor pipe.** Synthetic microbenchmark, no model load.
+2. **Does TU117 have a usable IMMA tensor pipe.** DONE, see section 7.
 3. **`GGML_CUDA_FORCE_MMQ` / forcing the pascal-dp4a table** to compare `I=64, stream_k=false`
    against the ampere table on identical work. This needs a build flag, so it is a build A/B, not a
    runtime switch.
+
+## 7. TU117 has no tensor pipe, and the MoE uses it anyway - 10x penalty
+
+`tmp/prof/imma.cu` + `tmp/prof/ncu/imma_results.txt`. Runs in seconds, no model load. Operands in
+registers, zero memory traffic, so the only thing changing between rows is the instruction. The
+IMMA kernel issues the exact asm `mma.cuh` emits on Turing, 4 independent accumulator chains so the
+measurement is not latency-bound on the dependency chain.
+
+| path | GMAC/s | MAC/SM/cycle | power |
+|---|---:|---:|---:|
+| `IMMA.8816.S8.S8` (the m8n8k16 that Turing gets) | **500.9** | **24.6** | **16.0 W** |
+| `__dp4a` (IDP, the int8 doing the same math) | 5015.2 | 246.2 | 25.4 W |
+| `FFMA` (FP32 pipe reference) | 1252.5 | 61.4 | 24.1 W |
+| spin loop, no memory traffic | - | - | 23.4 W |
+
+**The harness is validated, which is what makes the rest credible:** FFMA reaches
+**1252.5 GMAC/s = 95.9%** of the T1000's published FP32 peak (2.61 TFLOP/s = 1305 GMAC/s). A test
+rig that hits 96% of a known peak is measuring what it claims to. The scaling check prints time
+against iteration count and gives a clean 4x slope per 4x iterations for all three rows, so none of
+the loops were eliminated.
+
+The reading:
+
+- **`__dp4a` is 10.0x faster than `IMMA` at the same arithmetic.** dp4a does 4 MAC per instruction
+  and issues at ~61 instr/SM/cycle. `IMMA.8816` claims 1024 MAC per warp instruction (32 per
+  thread) yet lands at 24.6 MAC/SM/cycle, i.e. about **one instruction per 42 cycles per SM**
+  against dp4a's 4.2 cycles for the same 1024 MACs. If TU117 had a tensor pipe of even modest rate
+  it would beat dp4a outright, since the instruction nominally carries 8x the work. It does not;
+  it is 10x slower.
+- **`IMMA` is also 2.5x slower than plain FFMA**, which needs ~17 cycles to do 1024 MACs at the
+  measured FFMA rate. So `IMMA` is not merely riding the FP32 pipe - it is worse than just
+  dequantizing and using FFMA. This is the signature of an emulated instruction on a part without
+  the unit.
+- **Power confirms it independently.** `IMMA` draws **16.0 W**, *below* a zero-byte spin loop at
+  23.4 W and far below dp4a at 25.4 W. The card is barely working while it issues `IMMA`. This is
+  the same signature as the unexplained 18.8 W of the real run.
+
+**Why it is selected.** `mma.cuh` and the MMQ config both gate on
+`turing_mma_available(cc)`, which is `GGML_CUDA_CC_IS_NVIDIA(cc) && highest_compiled_arch(cc) >= 750`.
+The real device reports `cc = 750`, so the gate opens. But **sm_75 spans two different dies**: TU117
+(the Quadro T1000) has no tensor cores at all, while TU106/TU116 do. The gate tests the compute
+capability, which is identical, and cannot tell them apart. Every MoE matmul in this build is
+therefore issued as `IMMA` on a part where `IMMA` is 10x slower than the `__dp4a` it replaced.
+
+This is a candidate single explanation for all three open anomalies at once:
+
+- **The 18.8 W of a 50 W budget** - `IMMA` at 16.0 W is measured to draw less than a spin loop.
+- **`-ngl 99` being slower than `-ngl 1`** - the per-node GPU time is 17% higher when the same
+  weights are resident, because the resident path runs more `IMMA` per unit work.
+- **The `-ngl 1` against CPU verdict** - the user's observation that CPU cores beat the GPU per
+  millisecond is exactly what a 10x `IMMA` penalty predicts.
+
+Not yet established: what fraction of the real kernel's time is `IMMA`. The J=128 kernel contains
+1024 `IMMA` and 2048 `FFMA`, so `IMMA` is on the critical path, but the split has not been measured.
+Also not established: whether an upstream fix already exists for TU117 detection. Per the project
+rules I am not writing that change; it is reported here for the maintainer to judge.
