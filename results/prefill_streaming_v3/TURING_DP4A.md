@@ -295,26 +295,42 @@ The copy is 62% of the ubatch and sits at the PCIe ceiling. It is already overla
 2-slot path, but the serial instrument shows the phases sum to more than the ubatch, so the overlap
 is not complete. Hiding the copy is now the largest single win available.
 
-Expected throughput in each limit, using the measured phase times (compute 2039.1 ms and copy
-3720.9 ms over 46 layers for 1024 tokens):
+Using the measured phase times (compute 2039.1 ms and copy 3720.9 ms over 46 layers for 1024
+tokens), plus the two throughputs actually measured:
 
-| limit | per-ubatch time | tokens/s |
-|---|---:|---:|
-| compute bound, no copy at all | 2039 ms | 502 |
-| copy bound, no overlap | 3721 ms | 275 |
-| copy bound, complete overlap | max(2039, 3721) = 3721 ms | 275 |
-| current, serial (no overlap) | 5760 ms | **178** |
-| current, 2-slot (partial overlap) | 7096 - 1336 = 5760 ms measured | **149.5** |
-
-Two readings of this deserve care.
+| configuration | per-ubatch | tokens/s | measured? |
+|---|---:|---:|:---:|
+| compute only, no copy at all | 2039 ms | 502 | no, unachievable |
+| copy only, no compute at all | 3721 ms | 275 | no, unachievable |
+| ideal: copy and compute fully overlapped | max(2039, 3721) = 3721 ms | 275 | no |
+| serial, 1 slot, `-ngl 99` | 7096 ms | **143.2** | **yes** |
+| pipelined, 2 slot, `-ngl 1` | 6977 ms | **146.8** | **yes** |
 
 **The copy-bound ceiling is 275 t/s**, not 502. Even if the compute became free, every ubatch still
-has to move 45.86 GiB at 12.4 GB/s, which takes 3721 ms. So the headroom from perfect overlap is
-149.5 -> 275 t/s, a further **1.84x**, and that is the hard ceiling for this approach at ub 1024.
+has to move 45.86 GiB at 12.4 GB/s, which takes 3721 ms. So the headroom from *perfect* overlap is
+143 -> 275 t/s, a further **1.92x**, and that is the hard ceiling for this approach at ub 1024.
 
 **This does not need to be calculated - it falls out of the copy rate, which is a hardware
 constant.** 45.86 GiB / 12.4 GB/s = 3713 ms per ubatch, and 1024/3.713 = 276 t/s. The measured
 3720.9 ms agrees to 0.2%, so the ceiling is already known and no sweep is needed to find it.
+
+**But the two measured rows say something uncomfortable.** The 2-slot pipeline, which exists
+*precisely to* overlap the copy with the compute, is **1.7% faster than the serial one** (146.8 vs
+143.2 t/s). It is not at 275 t/s, and it is not even at 178 t/s. So whatever overlap the double
+buffer is achieving is almost nothing: the two configurations sit 2% apart when their ideal
+separation is 1.92x.
+
+That makes the copy-overlap work the largest single lead, and it also means the lead should be
+approached as a **bug hunt, not an optimisation**. Something is serialising the copy against the
+compute, and the candidates are already enumerated in `Tasks_Fix_CUDA_Asynchronous_Copy.md`
+(unpinned host buffers silently making `cudaMemcpyAsync` synchronous; streams created without
+`cudaStreamNonBlocking`; library work landing on the null stream and becoming a global barrier).
+The `<1% overlap` figure in that file's context section is consistent with the 1.7% measured here.
+
+Note that the serial figures above are **not** directly comparable to the pipelined ones as an
+accounting: in serial mode the phases are disjoint and they sum to 5760 ms of a 7096 ms ubatch, so
+1336 ms (18.8%) sits outside both phases. That residual is host-side gap between the timed regions,
+not unmeasured device work, and it is why the serial row cannot simply be read as "copy + compute".
 
 ### Why ub 2048 should help, and what it is worth
 
@@ -364,21 +380,33 @@ identical, and throughput rises 1.53x at pp512 and 1.77x at pp1024 while power r
 
 **Not established:** how much of the gain is the change of *instruction* rather than the change of
 *tile shape*. The dp4a table also uses `I=64, J<=64` and `stream_k=false`, where the ampere table
-used `I=128, J<=128` and `stream_k=true`. All three differ at once. Isolating them needs further
-builds. The microbenchmark shows the instruction is 10x slower in isolation, but that is not the
-same as attributing the end-to-end gain to it.
+used `I=128, J<=128` and `stream_k=true`. All three differ at once. Isolating them needs four
+builds; the plan is in `BEFORE_CONTRIBUTE_TASKS.md` section 2, and it is deferred rather than
+blocking, because the *review* is what needs the attribution, not the measurement. The
+microbenchmark shows the instruction is 10x slower in isolation, but that is not the same as
+attributing the end-to-end gain to it.
 
 **Measured: `-ngl 99` benefits more than `-ngl 1` overall.** On prefill the gap closed to 2.4%
 (143.22 against 146.79), against 8.7% on the baseline, and on decode `-ngl 99` is 1.95x faster
 (18.07 against 9.28 t/s). So `-ngl 99` is now the preferred configuration, reversing the baseline's
 conclusion. See the section above.
 
+**The one measurement that is still open and is not an arithmetic question** is the 1.7% overlap
+between the serial and pipelined configurations, where the ideal separation is 1.92x. Everything
+else above follows from a measured phase time or from the bus. This does not.
+
 **Relevance to the power question.** The standing question was why power only reaches ~25% of the
 50 W cap. On the baseline, GPU power during this workload sits at 18.2 W. With the workload now
 almost twice as fast it still only reaches 22.3 W mean and 30.2 W peak. So the dp4a change explains
 why the part was *slow*, and it does raise power per unit time as predicted, but it does not by
-itself explain the ceiling: even at 1.77x throughput the part is not near its limit. The remaining
-gap is a separate question.
+itself explain the ceiling: even at 1.77x throughput the part is not near its limit.
+
+The 1.7% overlap is a live candidate for the rest of it. If the copy and the compute are in fact
+serialised, then the card is idle in the arithmetic sense for 62% of each ubatch, and the power mean
+is a weighted average of a compute phase and a near-idle copy phase. `CALIBRATION.md` section 1f
+measured a pinned H2D copy at **16.1 W** against 12.8 W idle, so a phase that cannot draw much is
+62% of the run. That is consistent with a ceiling near a third of the power limit without any
+additional explanation, and it makes the copy-overlap work answer two questions at once.
 
 ## Upstream status
 
