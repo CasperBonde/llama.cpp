@@ -116,8 +116,17 @@ Direct measurement, reference config, `-r 4`, `nvidia-smi` sampled at 0.5 s:
 
 **There is no idle window. The GPU is occupied but stalled** - warps are resident and waiting,
 inside a launched grid. That is consistent with an SM-attached occupancy of 100% and a DRAM
-utilization of 8-15%: the memory system is not saturated either, so the wait is dominated by
-latency, not bandwidth (see section 6).
+utilization of 8-15%: the memory system is not saturated either.
+
+**The cause is found: the host is blocked in the per-split synchronize, so the SMs run out of
+work.** See section 6.3 and `SYNC_BARRIER.md`. The host is inside
+`ggml_backend_synchronize(split_backend)` for 65.8% of the ubatch at `-ngl 1` and 73.1% at
+`-ngl 99`, and removing it takes pp1024 from 81.45 to 115.46 t/s. So "occupancy 100%" was never a
+statement about work issued - it is satisfied by the one range that is resident while the host
+waits for it to retire.
+
+This also answers the earlier framing of this section. The wait was attributed to memory latency
+and later to the kernel's shape. It is neither: it is a host-side serialization of the graph.
 
 ### 4.1 Power: the independent confirmation
 
@@ -332,18 +341,30 @@ inside the compute time.
 This correction does **not** touch the pp2048 cliff (6.8), which is real and is about the
 new-graph path, not about overlap.
 
-### 6.3 The split sync is a correctness barrier, not a scheduling artifact
+### 6.3 The split sync is the stall, and it is also a correctness barrier
 
-`ggml_backend_synchronize(split_backend)` at `ggml/src/ggml-backend.cpp:1833` looks like a
-scheduling wart. Gating it behind `LLAMA_SCHED_NO_SPLIT_SYNC` gives **115.59 t/s** at pp1024 and
-removes the pp decay entirely - but **produces garbage output**
-(`/ far of UBL中心主任age.sinuj足Y`). The callback is told layer `il` is done while it is still
-running, and refills the slot the running layer may still read.
+`ggml_backend_synchronize(split_backend)` at `ggml/src/ggml-backend.cpp:1831` is called after every
+graph range the scheduler submits. It is not a scheduling wart to be removed: gating it behind
+`LLAMA_SCHED_NO_SPLIT_SYNC` gives **115.46 t/s** at pp1024 `-ngl 1` and **117.08 t/s** at `-ngl 99`,
+but **produces garbage output** (`/ far of UBL中心主任age.sinuj足Y`). The callback is told layer `il`
+is done while it is still running, and refills the slot the running layer may still read.
 `ggml_backend_cuda_synchronize` is `cudaStreamSynchronize(cuda_ctx->stream())` - stream-scoped,
 not device-wide.
 
-Consequence: 115.59 is the speed of a broken pipeline, not a target. Any scheme that removes the
-barrier must first prove the slot is not being read.
+Measured with `LLAMA_SCHED_SYNC_AUDIT=1`, the host is inside that synchronize for **65.8% of the
+ubatch at `-ngl 1` (8690.9 of 13211.6 ms) and 73.1% at `-ngl 99` (10065.6 of 13764.6 ms)**. This is
+the answer to section 4: the SMs are not short of work, the host will not feed them. See
+`SYNC_BARRIER.md` for the full table and method.
+
+Consequence: 115-117 t/s is the speed of a broken pipeline, not a target. Any scheme that removes
+the barrier must first prove the slot is not being read. **And every per-layer compute number in
+this investigation is conditional on the barrier being present** - with it removed the measured
+"compute" collapses to ~0 because nothing forces the host to wait for the GPU at all.
+
+Historical note on how this was missed: an earlier session measured "32-bit loads plus 1 block/SM
+are the smoking gun, vectorising the load is worth 2.50x", which was traced to a synthetic kernel
+with a *runtime* trip count. The real kernel was exonerated (7944 straight-line instructions, the
+load loop fully unrolled). The stall was host-side all along.
 
 ### 6.4 L2 is not thrashing
 
@@ -475,13 +496,20 @@ the reference config would look like if all weights were in VRAM:
 | `-ngl 99 -ps 1` serial | 74.52 +- 0.24 t/s |
 | `-ngl 99 -ps 1` overlapped | **does not fit** (OOM at context creation) |
 
-**Processing the whole layer on the GPU (213.0 ms/layer) is slower than processing it with the
-attention kept on the CPU while the weights are posted in (131.9 ms/layer).** The compute is 61%
-slower, and the result is 9.6% slower end to end despite removing the attention host traffic (78.7
-vs 80.9 ms of copy). So the PCIe link is not the constraint the design assumes; the **GPU work per
-layer is**. Note also that `-ngl 99` moves *less* per refill (996.00 vs 1022.41 MiB, the attention
-is already resident) yet computes 213 ms/layer against 131.9 ms/layer - the extra GPU-resident
-attention is itself the expensive part.
+`-ngl 99` serial moves *less* per refill (996.00 vs 1022.41 MiB, the attention is already
+resident) and still ends up 9.6% slower. **This was first attributed to GPU-resident attention
+costing 61% more per layer, from the grouped means (213.0 vs 131.9 ms/layer). That was an
+averaging artifact and is withdrawn.** The per-layer dump shows the regression is a 2.6x spike on
+layers 0-5 only:
+
+| layers | `-ngl 1` | `-ngl 99` |
+|---|---:|---:|
+| 0-5 | 125.3-125.5 (gdn), 151.7 (attn) | **391.2, 394.6, 446.6, 463.4, 463.9, 493.0** |
+| 6-45 | 124.7-125.8 (gdn), 151.0-151.8 (attn) | **170.4-177.6**, uniform |
+
+Layers 6-45 are *faster* per layer at `-ngl 99` than at `-ngl 1` (GDN 177.2 vs 125.3 means the
+GPU work genuinely grew, but the spread is gone). The entire `-ngl 99` deficit is the first six
+layers. See `SYNC_BARRIER.md` section 3 for what those six layers are really measuring.
 
 ### Status
 
@@ -492,22 +520,24 @@ attention is itself the expensive part.
 
 ## 8. Open questions, in priority order
 
-1. **Why is the GPU at 100% occupancy but drawing less power than a spin loop that moves zero
-   bytes?** Both the idle theory and any throttling theory are dead (section 4, 4.1). Section 4.2
-   now splits copy from compute directly and shows **both phases draw 18.8 W**, so the copy is
-   ruled out as the cause and the question is entirely about what the SMs wait on during compute.
-   The right instrument is `smsp__warp_issue_stalled_*` (ncu group C) on the real kernel, on a
-   known-throughput config.
+1. **The SM is not short of work; the host will not feed it.** SOLVED, see `SYNC_BARRIER.md`.
+   `ggml_backend_sched_compute_splits` blocks in `ggml_backend_synchronize(split_backend)` after
+   every graph range: **8690.9 ms of a 13211.6 ms ubatch (65.8%)** at `-ngl 1` and **10065.6 ms of
+   13764.6 ms (73.1%)** at `-ngl 99`. Removing it takes pp1024 from 81.45 to **115.46 t/s**
+   (`-ngl 1`) and 74.95 to **117.08 t/s** (`-ngl 99`). 115.46 reproduces the 115.59 recorded
+   earlier by a different route.
+   **Still open: the fix.** The barrier is a correctness requirement (the eval callback refills
+   storage a running range may still read), so 115-117 t/s is the speed of a broken pipeline, not
+   a target. The remaining question is how to keep the ordering without blocking the host.
 2. **Re-check T2.5.3** (slots not re-seeded on the reused-graph path). It is now believed to be a
    **false alarm** (section 9) - it was inferred from NOCOPY runs, which zero-fill the slots and
-   produce wrong output by design. No correctness failure has ever been observed without a debug
-   flag that is documented as breaking the output. It needs a clean re-test or deletion, not a fix.
+   produce wrong output by design.
 3. **Build the valid copy control** (T2.2.1): refill the slot from a VRAM-resident copy
    (host -> VRAM once, then VRAM -> VRAM). NOCOPY is not it.
 4. **The 2x512 single-run loss** (section 7). Blocked on 3.
-5. **Why does GPU-resident attention cost 81 ms more per layer than host-resident attention**
-   (section 7, 213.0 vs 131.9 ms/layer)? This is a new question the `-ngl 99` serial run raised
-   and it is not explained by the copy.
+5. **Why do layers 0-5 stall 2.6x longer than layers 6-45 at `-ngl 99`?** The spike is a barrier
+   stall (SYNC_BARRIER.md 3), not compute, but why it concentrates in the first six layers is not
+   explained.
 
 ---
 
@@ -541,6 +571,14 @@ attention is itself the expensive part.
   The `-ngl 99` configuration does not fit on this card (section 7) and those runs died at
   context creation. The comparison has to be made with the serial 1-slot mode, where it does
   fit, and there it shows a 9.6% difference in favour of `-ngl 1` (81.36 vs 74.52).
+- **"Processing the whole layer on the GPU costs 61% more per layer than streaming it with the
+  attention on the CPU (213.0 vs 131.9 ms/layer), so GPU-resident attention is expensive"** -
+  **withdrawn, it was an averaging artifact.** The grouped means averaged over a 2.6x spike that is
+  confined to layers 0-5 (391-493 ms); layers 6-45 are flat at 170-178 ms. The per-layer dump
+  (`LLAMA_PREFILL_STREAMING_SERIAL_LIST=1`) is what exposed it, and `SYNC_BARRIER.md` section 3
+  shows the spike is a barrier stall rather than compute. **Rule: never conclude from a grouped mean
+  without dumping the group in order at least once.**
+- **"...so the ceiling is GPU work per layer, not PCIe"** - same artifact, withdrawn.
 - **"Overlapping the copy costs 3x"** (archive: `FINDINGS_the_cliff.md`) - corrected in 6.2. The
   ratio used a NOCOPY compute column, so it divided a real observation by a compute figure about
   6x too small. The directly measured interference is **0.75x of the copy**, and the overlap is
