@@ -33,6 +33,26 @@ an absolute draw, so subtract that floor to get the cost of the work.
 All with **grid 8192, block 256, 996 MiB** - identical to the llama.cpp grid-8192 expert
 kernel's launch shape.
 
+> **Correction (2026-09-20, later).** "Grid 8192" was **inferred, not measured**, and it is wrong
+> for the MoE matmul. The 8192 is `nty * ntx` for one dense weight at a time, i.e. `(8192/128) *
+> (512/8)` for the ampere table; the launch actually used is `dim3(nty, ntx, ntzw)` with
+> **`ntzw = nchannels_y = n_experts = 512`**, so the real grid is site dependent:
+>
+> | site | table | grid | smem |
+> |---|---|---:|---:|
+> | MoE gate/up, Q4_K, ub 512 | ampere (baseline) | `(4, 64, 512)` = 131072 | 56.5 KB |
+> | MoE down, Q6_K, ub 512 | ampere (baseline) | `(16, 64, 512)` = 524288 | 56.5 KB |
+> | dense, Q4_K, ub 512 | ampere (baseline) | `(4, 64, 1)` = 256 | 56.5 KB -> grid = nsm = 14 |
+> | MoE gate/up, Q4_K, ub 1024 | dp4a | `(8, 16, 512)` = **65536** | 19.2 KB |
+> | MoE down, Q6_K, ub 1024 | dp4a | `(32, 16, 512)` = **262144** | 27.4 KB |
+>
+> Volumes #3 and #5 above are unaffected in *shape* (997 MiB read, 256 threads) but the smem figure
+> matters for the occupancy argument, and #5 had the smem set as if the launch were 8192 blocks.
+> The conclusions drawn from the synthetic sweeps are about bandwidth and occupancy and do not
+> depend on the block count, so they stand; the "identical to the llama.cpp launch shape" claim for
+> the grid does not. See `TURING_DP4A.md` for the corrected table.
+
+
 | test | GB/s | notes |
 |---|---:|---|
 | `read_chunk` sequential uint4 read | **118.1** | 4 blocks/SM |
@@ -328,6 +348,9 @@ the scheduling. Three candidates remain, in order of plausibility:
 Note the deliberate omission: `cp.async` is **not** a candidate. It is gated to
 `__CUDA_ARCH__ >= 800` by design and this is an sm_75 part, so the hardware cannot do
 asynchronous copies and there is nothing to fix there.
+WARNING: This is DMA inside the GPU - from VRAM to SRAM.
+This is not the cudaMemcpyAsync() needed to copy from CPU RAM
+to VRAM. That is supported on the T1000
 
 ## 4. The busy-poll hypothesis: source-checked and not found
 
@@ -376,7 +399,8 @@ Two instruments added this session. Both are reusable, and neither needs ncu or 
 
 ### 6.1 The serial measurement window
 
-`LLAMA_PREFILL_STREAMING_SERIAL=1` uses **one** slot instead of two and forces the next layer's
+To be able to compare -ngl 1 vs -ngl 99 the
+`LLAMA_PREFILL_STREAMING_SERIAL=1` was CHANGED to use **one** slot instead of two and forces the next layer's
 copy to be **blocking** inside the eval callback, before that layer is submitted. Copy and compute
 are then disjoint intervals and the code times them per layer:
 
@@ -385,6 +409,7 @@ one callback invocation per layer:
     refill(layer n+2)   <- blocking copy, timed around the call
     compute(layer n+1)  <- timed from the ask to the next callback
 ```
+This is a temporary experiment to be reverted to async later.
 
 Properties that make it a usable instrument:
 

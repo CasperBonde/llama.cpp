@@ -1192,24 +1192,16 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
-// Whether the tensor core path can be used on the device at hand. cc alone cannot answer this for
-// the 75 family: TU117 has no tensor cores while TU106 and TU116 do, and all three report cc 75.
-// The device info carries the answer. A build that turns the Turing tensor core path off also
-// answers false, so that callers never select kernels that are not in the binary.
+// Whether the tensor core MMQ path can be used on the device at hand. A build with
+// GGML_CUDA_TURING_NO_MMA has no Turing tensor core kernels at all, so it answers false. Without
+// that option this asks the plain cc question and the device flag is not consulted: the names it
+// covers were already treated as tensor core capable, and changing that would alter the path taken
+// on hardware this was never measured on.
 static bool turing_mma_available_dev() {
 #ifdef GGML_CUDA_TURING_NO_MMA
     return false;
 #else
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!turing_mma_available(cc)) {
-        return false;
-    }
-    const ggml_cuda_device_info & info = ggml_cuda_info();
-    const int id = ggml_cuda_get_device();
-    if (id >= 0 && id < info.device_count) {
-        return info.devices[id].tensor_cores;
-    }
-    return info.devices[0].tensor_cores;
+    return turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 #endif // GGML_CUDA_TURING_NO_MMA
 }
 

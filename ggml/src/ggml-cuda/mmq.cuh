@@ -1510,6 +1510,22 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
     }
 
+    // LLAMA_MMQ_DEBUG: the chosen tile shape per launch, to check the table against the workload
+    // instead of inferring it. off unless the variable is set.
+    static const bool mmq_debug = getenv("LLAMA_MMQ_DEBUG") != nullptr;
+    if (mmq_debug) {
+        const ggml_cuda_mmq_config cfg = ggml_cuda_mmq_get_config(type, J_best, fallback, cc);
+        const int nty  = (int) ((args.nrows_x   + cfg.I - 1) / cfg.I);
+        const int ntx  = (int) ((args.ncols_max + cfg.J - 1) / cfg.J);
+        const int ntzw = (int) (args.nchannels_y * args.nsamples_y);
+        fprintf(stderr, "MMQ_DEBUG type=%d J=%d I=%d nthreads=%d stream_k=%d nrows_x=%lld ncols_dst=%lld "
+                "ncols_max=%lld channels_y=%lld samples_y=%lld -> nty=%d ntx=%d ntzw=%d tiles=%d smem=%zu\n",
+                (int) type, J_best, cfg.I, cfg.nthreads, (int) cfg.stream_k,
+                (long long) args.nrows_x, (long long) args.ncols_dst, (long long) args.ncols_max,
+                (long long) args.nchannels_y, (long long) args.nsamples_y,
+                nty, ntx, ntzw, ntx*nty*ntzw, mmq_get_nbytes_shared(cfg, cc));
+    }
+
     switch (J_best) {
         case   8:
             launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
