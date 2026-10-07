@@ -93,7 +93,7 @@
 !/examples/sycl/*.sh
 
 # Python
-
+/venv
 /.venv
 __pycache__/
 */poetry.lock

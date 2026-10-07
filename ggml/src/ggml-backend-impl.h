@@ -153,6 +153,28 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) staging arena [TAG_STAGED_SPLIT]
+        //
+        // A backend that implements these can have the copy of one split issued while the split
+        // before it is still computing, provided that copy goes into a buffer of its own.
+        // staged_set_tensor enqueues a flat host to device copy out of the way of the compute
+        // stream and without blocking the host. staged_wait_compute makes that copy wait for the
+        // compute stream, so a region reused later in the graph is not written while the compute
+        // still reads it.
+        void (*staged_set_tensor)  (ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+        // same, for a MoE weight: copy only the experts the router selected. the ids live on the
+        // device, so the backend reads them back itself and issues one copy per run of
+        // consecutive experts, all of it on its staging stream. Without this the whole tensor is
+        // copied, which is most of the traffic of the split it belongs to.
+        void (*staged_set_experts) (ggml_backend_t backend, struct ggml_tensor * tensor,
+                const void * src, struct ggml_tensor * ids, int64_t n_expert, size_t expert_size);
+        void (*staged_wait_compute)(ggml_backend_t backend);
+        // record where the staged copy has reached, and make the compute stream wait for that
+        // point. The record has to happen right after the copy is issued: recording it later would
+        // also cover copies issued in between, and the compute would then wait for those too.
+        void (*staged_ready_record)(ggml_backend_t backend, ggml_backend_event_t event);
+        void (*staged_wait_ready)  (ggml_backend_t backend, ggml_backend_event_t event);
     };
 
     struct ggml_backend {

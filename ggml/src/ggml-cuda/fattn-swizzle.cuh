@@ -27,7 +27,7 @@ static __host__ bool enabled(const int nbatch_2, const int cc) {
     GGML_UNUSED(cc);
     return false;
 #else
-    return turing_mma_available(cc) && bank_aligned(nbatch_2);
+    return tensor_cores_available(cc) && bank_aligned(nbatch_2);
 #endif // GGML_USE_HIP
 }
 

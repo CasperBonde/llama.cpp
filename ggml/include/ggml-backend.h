@@ -330,6 +330,18 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // [TAG_STAGED_SPLIT] staging arena
+    //
+    // When a split has to stage an input into device memory, the scheduler normally issues that
+    // copy right before the split runs, which serializes the copy with the compute of the split
+    // before it. With a staging arena the copy can be issued one split early, so it overlaps that
+    // compute, and it targets a different buffer than the one the running split reads.
+    //
+    // ggml_backend_sched_pipeline_init allocates the arena and returns the number of copies that
+    // can be staged, or 0 if the configured backends cannot stage. Call it before the first
+    // compute that should use the arena.
+    GGML_API int ggml_backend_sched_pipeline_init(ggml_backend_sched_t sched, int n_slots, size_t slot_size);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 

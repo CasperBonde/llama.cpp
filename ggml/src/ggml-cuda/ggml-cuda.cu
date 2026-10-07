@@ -381,7 +381,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
-        GGML_LOG_INFO("The following devices have no tensor cores and will use the dp4a MMQ path instead:\n");
+        GGML_LOG_INFO("The following devices have no tensor cores: MMQ uses the dp4a path"
+                      " and flash attention uses the tile kernel:\n");
         for (size_t device_pos = 0; device_pos < turing_devices_without_mma.size(); device_pos++) {
             GGML_LOG_INFO(
                 "  Device %d: %s\n", turing_devices_without_mma[device_pos].first, turing_devices_without_mma[device_pos].second.c_str());
@@ -711,6 +712,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    if (staged_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(staged_stream));
+    }
+    if (staged_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(staged_event));
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2448,6 +2455,129 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+// [TAG_STAGED_SPLIT] enqueue a flat host-to-device copy on the staging stream. The scheduler uses
+// this to issue the copy of a split while the split before it is still computing, so it must not
+// touch the compute stream and must not block the host.
+static void ggml_backend_cuda_set_tensor_staged(ggml_backend_t backend, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice,
+            cuda_ctx->staged_copy_stream()));
+}
+
+// [TAG_STAGED_SPLIT] enqueue the gather of one split's MoE weight, for the selected experts only.
+//
+// The weights are contiguous in expert order and the expert ids are on the device, so the gather
+// can be issued without the host ever seeing them: read the ids back, then issue one copy per run
+// of consecutive experts. That is what mainline does in the scheduler, and doing it here keeps
+// every copy on the staging stream and keeps the host out of the loop.
+//
+// The two syncs below block the host. They cannot be avoided: the host has to know which experts
+// were routed before it can issue anything, and the ids only exist once the split that computes
+// the routing has run. The caller issues this far enough ahead that the split that computes the
+// routing is already drained, so in practice the readback has nothing to wait for.
+static void ggml_backend_cuda_staged_set_experts(ggml_backend_t backend, ggml_tensor * tensor,
+        const void * src, ggml_tensor * ids, int64_t n_expert, size_t expert_size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    if (src == nullptr || ids == nullptr || expert_size == 0 || n_expert <= 0) {
+        return;
+    }
+
+    const int64_t n_ids = ids->ne[0] * ids->ne[1];
+    if (n_ids <= 0 || (size_t) n_ids * sizeof(int32_t) > (size_t) 512*1024*1024) {
+        return;
+    }
+
+    // the ids are a view with padded rows: nb[1] is larger than ne[0]*nb[0]. Read the whole tensor
+    // and walk it with its own strides. A linear read would only see the first rows and would then
+    // treat the padding between the rows as expert ids.
+    const size_t ids_bytes = ggml_nbytes(ids);
+    if (ids_bytes == 0 || ids_bytes % sizeof(int32_t) != 0) {
+        return;
+    }
+    std::vector<int32_t> ids_host(ids_bytes / sizeof(int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ids_bytes,
+            cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    const size_t ids_stride0 = ids->nb[0] / sizeof(int32_t);
+    const size_t ids_stride1 = ids->nb[1] / sizeof(int32_t);
+
+    const size_t n_bytes = ggml_nbytes(tensor);
+    std::vector<ggml_bitset_t> used(ggml_bitset_size(n_expert));
+    for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+            const int32_t id = ids_host[i1 * ids_stride1 + i0 * ids_stride0];
+            if (id >= 0 && id < n_expert) {
+                ggml_bitset_set(used.data(), id);
+            }
+        }
+    }
+
+    // one copy per run of consecutive experts, exactly like the scheduler's gather
+    int64_t lo = -1;
+    for (int64_t e = 0; e <= n_expert; e++) {
+        const bool in = e < n_expert && ggml_bitset_get(used.data(), e);
+        if (in) {
+            if (lo < 0) {
+                lo = e;
+            }
+            continue;
+        }
+        if (lo < 0) {
+            continue;
+        }
+        // copy one extra 512 byte tail for the last expert: MMQ reads a rounded up row and would
+        // otherwise touch uninitialised padding. same as the scheduler's own gather.
+        const size_t off      = (size_t) lo * expert_size;
+        const size_t own      = std::min((size_t) (e - lo) * expert_size, n_bytes - off);
+        const size_t padding  = e < n_expert ? std::min<size_t>(expert_size, 512) : 0;
+        const size_t size     = own + std::min(padding, n_bytes - off - own);
+
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + off, (const char *) src + off, size,
+                cudaMemcpyHostToDevice, cuda_ctx->staged_copy_stream()));
+        lo = -1;
+    }
+}
+
+// [TAG_STAGED_SPLIT] make the staging stream wait for the compute stream.
+//
+// The arena is one region and a slot is reused by the next layer, so a location the running compute
+// may still read must not be overwritten. Waiting for the compute is what replaces the natural
+// ordering a single stream would have given, and it costs nothing when the compute is still busy:
+// the wait only holds the copy back until the queued compute has drained, which is a time the
+// scheduler would otherwise spend blocked on that compute anyway.
+static void ggml_backend_cuda_staged_wait_compute(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    if (cuda_ctx->staged_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->staged_event, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(cuda_ctx->staged_event, cuda_ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->staged_copy_stream(), cuda_ctx->staged_event, 0));
+}
+
+// [TAG_STAGED_SPLIT] mark how far the staged copy has got. Called right after the copy of a split
+// is issued, so that the event means "this split's copy is done" and not "every copy issued so far
+// is done", which is what would serialize the compute behind the next split's copy.
+static void ggml_backend_cuda_staged_ready_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event->context, cuda_ctx->staged_copy_stream()));
+}
+
+// [TAG_STAGED_SPLIT] make the compute of a split wait for its staged copy.
+//
+// This is the half that must not be omitted: without it the compute may start before the copy that
+// fills its weight has landed, and it then computes on whatever the arena held.
+static void ggml_backend_cuda_staged_wait_ready(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t) event->context, 0));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4785,6 +4915,11 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .staged_set_tensor       = */ ggml_backend_cuda_set_tensor_staged,
+    /* .staged_set_experts      = */ ggml_backend_cuda_staged_set_experts,
+    /* .staged_wait_compute     = */ ggml_backend_cuda_staged_wait_compute,
+    /* .staged_ready_record     = */ ggml_backend_cuda_staged_ready_record,
+    /* .staged_wait_ready       = */ ggml_backend_cuda_staged_wait_ready,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

@@ -1353,6 +1353,29 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    // [TAG_STAGED_SPLIT] the staging arena is sized to the largest tensor the scheduler stages into
+    // device memory, which for a partially offloaded MoE is one layer's experts.
+    if (getenv("LLAMA_SCHED_STAGED_SPLIT") != nullptr) {
+        size_t slot_size = 0;
+        for (const auto & tn : model.tensors_by_name) {
+            if (tn.first.find("ffn_") == std::string::npos) {
+                continue;
+            }
+            const size_t sz = ggml_nbytes(tn.second) + 32*1024*1024;
+            if (sz > slot_size) {
+                slot_size = sz;
+            }
+        }
+        if (slot_size > 0) {
+            const int n_slots = ggml_backend_sched_pipeline_init(sched.get(), 2, slot_size);
+            LLAMA_LOG_INFO("%s: staged split arena: %d slots x %.2f MiB = %.2f MiB (slot size from ffn tensors)\n",
+                    __func__, n_slots, slot_size/1024.0/1024.0,
+                    n_slots*slot_size/1024.0/1024.0);
+        } else {
+            LLAMA_LOG_WARN("%s: staged split requested but no suitable tensor was found\n", __func__);
+        }
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);

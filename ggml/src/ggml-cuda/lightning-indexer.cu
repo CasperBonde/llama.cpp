@@ -448,7 +448,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && tensor_cores_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
             // use wmma kernel
             constexpr int K_VECS_PER_BLOCK = 32;
             constexpr int WARPS_PER_BLOCK = 8;
@@ -489,7 +489,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     } else if (n_embd == 128 && n_head == 32) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && tensor_cores_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
             // use wmma kernel
             constexpr int K_VECS_PER_BLOCK = 32;
             constexpr int WARPS_PER_BLOCK = 8;

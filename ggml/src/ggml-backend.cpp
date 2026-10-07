@@ -781,6 +781,27 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+
+    // [TAG_STAGED_SPLIT] the staged copy of this split that can be moved into the arena
+    struct ggml_tensor * pipeline_input_ptr = nullptr; // split->inputs[] slot this plan is for
+    struct ggml_tensor * pipeline_input     = nullptr; // the host source of that copy
+    size_t               pipeline_offset    = 0;       // arena offset this split's copy lands at
+    size_t               pipeline_size      = 0;       // bytes of the copy
+
+    // when the copy is a MoE weight, only the experts the router selected have to be moved. these
+    // three say where the selection is and how the weight is laid out, so the backend can do the
+    // gather itself. pipeline_expert_size is 0 for a copy that is not an expert weight.
+    struct ggml_tensor * pipeline_ids         = nullptr; // the split's router output
+    int64_t              pipeline_n_expert    = 0;
+    size_t               pipeline_expert_size = 0;
+};
+
+// [TAG_STAGED_SPLIT] per-split staging state
+struct ggml_backend_sched_split_pipeline {
+    int                  slot   = -1;     // arena slot holding this split's staged copy
+    int                  reader = -1;     // last split that reads it
+    bool                 staged = false;  // a copy for this split was issued this walk
+    ggml_backend_event_t ready  = nullptr;
 };
 
 struct ggml_backend_sched {
@@ -811,6 +832,19 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_split * splits;
     int n_splits;
     int splits_capacity;
+
+    // [TAG_STAGED_SPLIT] staging arena. The copy of split i+1 is issued while split i computes,
+    // into its own region of this buffer, so it neither waits for that compute nor overwrites what
+    // it reads. Zero unless ggml_backend_sched_pipeline_init supplied a buffer type.
+    ggml_backend_buffer_t pipeline_buf         = nullptr;
+    size_t                pipeline_slot_stride = 0;
+    int                   pipeline_n_slots     = 0;
+
+    struct ggml_backend_sched_split_pipeline * pipeline     = nullptr;
+    int                                        pipeline_cap = 0;
+    // the device the arena, and therefore every staged copy, belongs to. the events that order a
+    // staged copy against the compute of the split that reads it are created on it.
+    ggml_backend_dev_t                         pipeline_device = nullptr;
 
     // pipeline parallelism support
     int n_copies;
@@ -1060,6 +1094,245 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+// assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// [TAG_STAGED_SPLIT] pick, for each split, the staged copy whose issue can be moved into the
+// arena, and give it a slot.
+//
+// At -ngl 99 the experts are not on the device, so a split has an input the scheduler copies into
+// device memory before the split runs. The allocator gives that copy one region for the whole
+// graph, so the copy of the next layer into it would overwrite the region the running split still
+// reads, which is what makes the copy of split i+1 wait for the compute of split i. The arena
+// gives each staged copy a region of its own, and that is what makes issuing it early possible.
+//
+// The arena is packed here rather than sized ahead of time: a slot is reused only after the last
+// split that reads the copy in it has been queued.
+static struct ggml_backend_sched_pipeline_why {
+    int n_inputs   = 0; // input copies considered
+    int n_host     = 0; // of those, host to device copies
+    int n_notweight = 0; // dropped: the source is an activation, not a weight
+    int n_view     = 0; // dropped: a view cannot be copied as a flat range
+    int n_toolarge = 0; // dropped: larger than one slot
+    int n_noevent  = 0; // dropped: the split has no ready event
+    int n_noslot   = 0; // dropped: no slot free at that point
+    int n_gather      = 0; // expert gathers planned
+    int n_gather_late = 0; // dropped: the router ids are not computed early enough for a gather
+} g_pipeline_why;
+
+static void ggml_backend_sched_pipeline_resolve(ggml_backend_sched_t sched) {
+    struct ggml_backend_sched_pipeline_why & why = g_pipeline_why;
+    why = ggml_backend_sched_pipeline_why();
+    for (int i = 0; i < sched->n_splits; i++) {
+        sched->splits[i].pipeline_input_ptr   = nullptr;
+        sched->splits[i].pipeline_input       = nullptr;
+        sched->splits[i].pipeline_offset      = 0;
+        sched->splits[i].pipeline_size        = 0;
+        sched->splits[i].pipeline_ids         = nullptr;
+        sched->splits[i].pipeline_n_expert    = 0;
+        sched->splits[i].pipeline_expert_size = 0;
+        sched->pipeline[i].slot   = -1;
+        sched->pipeline[i].reader = -1;
+    }
+
+    if (sched->pipeline_buf == nullptr) {
+        return;
+    }
+
+    const size_t arena_size = ggml_backend_buffer_get_size(sched->pipeline_buf);
+    const size_t stride     = sched->pipeline_slot_stride;
+    std::vector<int> slot_last_use(sched->pipeline_n_slots, -1);
+
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+
+        // created here and not only in pipeline_init: the split array can still grow after that,
+        // and a split without an event cannot be staged at all
+        if (i < sched->pipeline_cap && sched->pipeline[i].ready == nullptr &&
+                sched->pipeline_device != nullptr &&
+                sched->pipeline_device->iface.event_new != nullptr) {
+            sched->pipeline[i].ready = ggml_backend_event_new(sched->pipeline_device);
+        }
+
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input     = split->inputs[j];
+            struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            if (input_cpy == nullptr || input->buffer == nullptr || input_cpy->buffer == nullptr) {
+                continue;
+            }
+            why.n_inputs++;
+
+            // a staged copy is a host to device transfer; anything else is not the bottleneck
+            if (!ggml_backend_buffer_is_host(input->buffer) ||
+                 ggml_backend_buffer_is_host(input_cpy->buffer)) {
+                continue;
+            }
+            why.n_host++;
+
+            // only a weight may be staged. a weight is constant for the whole walk, so reading it
+            // one split early is safe. an activation is produced by an earlier split, and staging
+            // it would read it before that split has run, so the copy would move whatever the
+            // tensor held before.
+            if (ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                why.n_notweight++;
+                continue;
+            }
+
+            // the copy is a flat byte range, so a view cannot be staged
+            if (input->view_src != nullptr || input_cpy->view_src != nullptr) {
+                why.n_view++;
+                continue;
+            }
+
+            const size_t sz = ggml_nbytes(input_cpy);
+            if (sz == 0 || sz > stride) {
+                why.n_toolarge++;
+                continue;
+            }
+
+            // the copy stays in its slot until the last split that reads it has been queued. only
+            // the owner issues it; a later split that shares the same copy reads it.
+            int last_reader = i;
+            for (int k = i + 1; k < sched->n_splits; k++) {
+                for (int m = 0; m < sched->splits[k].n_inputs; m++) {
+                    if (tensor_copy(sched->splits[k].inputs[m], sched->splits[k].backend_id,
+                                sched->cur_copy) == input_cpy) {
+                        last_reader = k;
+                    }
+                }
+            }
+
+            if (i >= sched->pipeline_cap || sched->pipeline[i].ready == nullptr) {
+                why.n_noevent++;
+                continue;
+            }
+
+            int slot = -1;
+            for (int s = 0; s < sched->pipeline_n_slots; s++) {
+                // two splits of slack, not one. the copy of split i is issued while the loop is
+                // in iteration i-1, before the compute of i-1 has been submitted, so the event
+                // that ordering uses covers splits 0..i-2 only. a slot whose last reader is i-1
+                // is therefore still live and must not be reused.
+                if (slot_last_use[s] < i - 1) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot == -1) {
+                why.n_noslot++;
+                continue;
+            }
+
+            const size_t off = (size_t) slot * stride;
+            if (off + sz > arena_size) {
+                why.n_noslot++;
+                continue;
+            }
+
+            // a split whose first node is the expert matmul over this very weight can be served
+            // with the experts the router picked instead of the whole tensor. the ids are read
+            // from the split's own graph, which is the same tensor the kernel reads.
+            struct ggml_tensor * node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
+            if (node != nullptr && node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                struct ggml_tensor * ids = node->src[2];
+                why.n_gather++;
+
+                // if the ids are also an input of this split, the copy on the split's backend is
+                // not filled until the split runs, which is after this gather is issued, so the
+                // gather would select the experts of whatever ran before. read them from the
+                // tensor on the backend that produces them instead. the scheduler's own gather
+                // makes exactly this substitution.
+                for (int k = 0; k < split->n_inputs && ids != nullptr; k++) {
+                    if (ids == tensor_copy(split->inputs[k], split->backend_id, sched->cur_copy)) {
+                        ids = split->inputs[k];
+                        break;
+                    }
+                }
+
+                // the gather reads the ids back, so they have to be computed before the copy is
+                // issued. this copy is issued one split early, during the iteration before i, and
+                // the ordering event only covers the compute submitted before that. find the
+                // split that produces the ids and keep the gather only if that split is already
+                // behind us.
+                int ids_split = -1;
+                for (int k = 0; k < sched->n_splits && ids_split < 0; k++) {
+                    for (int n = 0; n < sched->splits[k].graph.n_nodes; n++) {
+                        if (sched->splits[k].graph.nodes[n] == ids) {
+                            ids_split = k;
+                            break;
+                        }
+                    }
+                }
+
+                if (ids != nullptr && ids_split >= 0 && ids_split <= i - 2) {
+                    split->pipeline_ids         = ids;
+                    split->pipeline_n_expert    = input->ne[2];
+                    split->pipeline_expert_size = input->nb[2];
+                } else {
+                    // the ids are produced by the split just before this one, so the gather would
+                    // read them before they exist. copy the whole weight instead: it is constant,
+                    // so copying it early is safe, it just moves more bytes.
+                    why.n_gather_late++;
+                }
+            }
+
+            split->pipeline_input_ptr = input_cpy;
+            split->pipeline_input     = input;
+            split->pipeline_offset    = off;
+            split->pipeline_size      = sz;
+            sched->pipeline[i].slot   = slot;
+            sched->pipeline[i].reader = last_reader;
+            slot_last_use[slot]       = last_reader;
+            break;
+        }
+    }
+}
+
+int ggml_backend_sched_pipeline_init(ggml_backend_sched_t sched, int n_slots, size_t slot_size) {
+    if (n_slots < 2 || slot_size == 0) {
+        return 0;
+    }
+
+    // the staged copy lands in an operand of the compute backend's graph, and the copy is a host
+    // to device transfer, so the compute backend's own device buffer is the destination to use.
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (int i = 0; i < sched->n_backends && buft == nullptr; i++) {
+        if (sched->backends[i]->iface.staged_set_tensor == nullptr) {
+            continue;
+        }
+        buft = ggml_backend_sched_get_buffer_type(sched, sched->backends[i]);
+    }
+    if (buft == nullptr) {
+        return 0;
+    }
+
+    if (sched->pipeline_buf != nullptr) {
+        ggml_backend_buffer_free(sched->pipeline_buf);
+        sched->pipeline_buf = nullptr;
+    }
+
+    sched->pipeline_buf = ggml_backend_buft_alloc_buffer(buft, slot_size * (size_t) n_slots);
+    if (sched->pipeline_buf == nullptr) {
+        return 0;
+    }
+
+    sched->pipeline_device      = buft->device;
+    sched->pipeline_n_slots     = n_slots;
+    sched->pipeline_slot_stride = slot_size;
+
+    for (int i = 0; i < sched->pipeline_cap; i++) {
+        if (sched->pipeline[i].ready == nullptr) {
+            sched->pipeline[i].ready = ggml_backend_event_new(sched->pipeline_device);
+            if (sched->pipeline[i].ready == nullptr) {
+                ggml_backend_buffer_free(sched->pipeline_buf);
+                sched->pipeline_buf = nullptr;
+                return 0;
+            }
+        }
+    }
+
+    return n_slots;
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1361,8 +1634,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     sched->splits = (ggml_backend_sched_split *)
                         realloc(sched->splits, sched->splits_capacity * sizeof(struct ggml_backend_sched_split));
                     GGML_ASSERT(sched->splits != NULL);
+                    sched->pipeline = (ggml_backend_sched_split_pipeline *)
+                        realloc(sched->pipeline, sched->splits_capacity * sizeof(struct ggml_backend_sched_split_pipeline));
+                    GGML_ASSERT(sched->pipeline != NULL);
+                    sched->pipeline_cap = sched->splits_capacity;
                     for (int k = old_cap; k < sched->splits_capacity; k++) {
                         memset(&sched->splits[k], 0, sizeof(struct ggml_backend_sched_split));
+                        memset(&sched->pipeline[k], 0, sizeof(struct ggml_backend_sched_split_pipeline));
                     }
                 }
                 split = &sched->splits[i_split];
@@ -1696,6 +1974,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // [TAG_STAGED_SPLIT] plan the staging here and not when the graph was split: a split cannot be
+    // checked for a host to device input copy until the graph has been allocated and the tensors
+    // have buffers. this runs before the split loop below for the same reason, and once per
+    // compute is enough because the plan only changes when the splits do.
+    if (sched->pipeline_buf != nullptr && sched->n_splits > 0) {
+        ggml_backend_sched_pipeline_resolve(sched);
+
+        static int staged_logged_for = -1;
+        if (staged_logged_for != sched->n_splits) {
+            staged_logged_for = sched->n_splits;
+            int n_staged = 0, n_expert = 0;
+            size_t max_size = 0;
+            for (int i = 0; i < sched->n_splits; i++) {
+                if (splits[i].pipeline_input_ptr == nullptr) {
+                    continue;
+                }
+                n_staged++;
+                if (splits[i].pipeline_expert_size > 0) {
+                    n_expert++;
+                }
+                if (splits[i].pipeline_size > max_size) {
+                    max_size = splits[i].pipeline_size;
+                }
+            }
+            GGML_LOG_INFO("%s: staged arena: %d of %d splits staged (%d as expert gathers), "
+                    "largest copy %.2f MiB, arena %.2f MiB\n",
+                    __func__, n_staged, sched->n_splits, n_expert, max_size/1024.0/1024.0,
+                    ggml_backend_buffer_get_size(sched->pipeline_buf)/1024.0/1024.0);
+            GGML_LOG_INFO("%s: staged arena: copies considered %d, host to device %d, not a "
+                    "weight %d, views %d, too large %d, no event %d, no slot %d, slot %.2f MiB\n",
+                    __func__, g_pipeline_why.n_inputs, g_pipeline_why.n_host,
+                    g_pipeline_why.n_notweight, g_pipeline_why.n_view,
+                    g_pipeline_why.n_toolarge, g_pipeline_why.n_noevent, g_pipeline_why.n_noslot,
+                    sched->pipeline_slot_stride/1024.0/1024.0);
+            GGML_LOG_INFO("%s: staged arena: gathers %d, gathered from a full copy %d\n",
+                    __func__, g_pipeline_why.n_gather, g_pipeline_why.n_gather_late);
+        }
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1743,12 +2060,111 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     };
 
+    // [TAG_STAGED_SPLIT] the staging primitives only make sense together with an arena, and every
+    // split of a stride has to use them or none, so the whole staging path is switched here once.
+    const ggml_backend_i * platform_staged = nullptr;
+    if (sched->pipeline_buf != nullptr) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            if (sched->backends[i]->iface.staged_set_tensor != nullptr &&
+                sched->backends[i]->iface.staged_wait_compute != nullptr &&
+                sched->backends[i]->iface.staged_ready_record != nullptr &&
+                sched->backends[i]->iface.staged_wait_ready != nullptr) {
+                platform_staged = &sched->backends[i]->iface;
+                break;
+            }
+        }
+    }
+
+    // a new compute reuses the arena from the beginning, so the pointers the previous one handed
+    // out have to stop pointing into it before anything else looks at them
+    if (platform_staged != nullptr) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (splits[i].pipeline_input_ptr != nullptr) {
+                splits[i].pipeline_input_ptr->data = nullptr;
+            }
+        }
+        // over the capacity and not over n_splits: a previous walk with more splits left the flag
+        // set past this walk's count, and the wait below would then reference an event it never
+        // armed, which is a wait on whatever the previous walk recorded
+        for (int i = 0; i < sched->pipeline_cap; i++) {
+            sched->pipeline[i].staged = false;
+        }
+    }
+
     int prev_backend_id = -1;
+
+    // [TAG_STAGED_SPLIT] issue one split's staged copy before the split that runs before it. A
+    // split's copy is otherwise issued in the iteration that submits the split, so the copy that
+    // holds it up is the one the host runs while the GPU is still computing the split before it.
+    // Issuing it here instead lets it proceed on the staging stream while that compute runs, and
+    // the wait on ready[] below keeps it ordered against the split that reads it.
+    int staged_next = 0;
+    auto staged_issue = [&](int idx) {
+        if (platform_staged == nullptr || idx < 0 || idx >= sched->n_splits) {
+            return;
+        }
+        // only one split is staged ahead. a split that reads the input its predecessor produced
+        // would otherwise stage the same copy again, and the pointer would change under the split
+        // that was about to read it.
+        if (sched->splits[idx].pipeline_input == nullptr ||
+                sched->splits[idx].pipeline_input->buffer == nullptr ||
+                !ggml_backend_buffer_is_host(sched->splits[idx].pipeline_input->buffer)) {
+            return;
+        }
+        struct ggml_backend_sched_split * sp = &splits[idx];
+        if (sp->pipeline_input_ptr == nullptr || sp->pipeline_size == 0) {
+            return;
+        }
+        // the source must still be a weight. the plan is made once per graph but this runs per
+        // walk, and staging an activation one split early reads it before its producer has run.
+        if (ggml_backend_buffer_get_usage(sp->pipeline_input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return;
+        }
+        if (sched->pipeline[idx].slot < 0) {
+            return;
+        }
+        struct ggml_tensor * dst = sp->pipeline_input_ptr;
+        dst->data = (char *) ggml_backend_buffer_get_base(sched->pipeline_buf) + sp->pipeline_offset;
+
+        // the arena is one region, so a slot reused in this stride cannot be written before the
+        // compute still reading it has finished
+        platform_staged->staged_wait_compute(sched->backends[sp->backend_id]);
+
+        if (sp->pipeline_expert_size > 0 && sp->pipeline_ids != nullptr &&
+                sched->backends[sp->backend_id]->iface.staged_set_experts != nullptr) {
+            platform_staged->staged_set_experts(sched->backends[sp->backend_id], dst,
+                    sp->pipeline_input->data, sp->pipeline_ids,
+                    sp->pipeline_n_expert, sp->pipeline_expert_size);
+        } else {
+            platform_staged->staged_set_tensor(sched->backends[sp->backend_id], dst,
+                    sp->pipeline_input->data, 0, sp->pipeline_size);
+        }
+
+        // right here, so the event covers this copy and not the ones issued after it
+        if (sched->pipeline[idx].ready != nullptr) {
+            platform_staged->staged_ready_record(sched->backends[sp->backend_id], sched->pipeline[idx].ready);
+        }
+        sched->pipeline[idx].staged = true;
+    };
+
+    // [TAG_STAGED_SPLIT] the first split's copy is issued here, before any compute of this graph.
+    // it cannot be overlapped with anything, but it has to happen for the wait below to be honest.
+    staged_next = 0;
+    staged_issue(0);
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // [TAG_STAGED_SPLIT] this split's copy was already issued, on the staging stream. This
+        // split has to start after it, exactly like a copy issued in the iteration above would
+        // have ordered: the copy is already computing when the compute is submitted, that is the
+        // whole point.
+        if (platform_staged != nullptr && sched->pipeline[split_id].staged &&
+                sched->pipeline[split_id].ready != nullptr) {
+            platform_staged->staged_wait_ready(split_backend, sched->pipeline[split_id].ready);
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1774,6 +2190,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            // [TAG_STAGED_SPLIT] this copy was already issued on the staging stream, before the
+            // split that runs before this one started computing.
+            if (input_cpy != nullptr && input_cpy == split->pipeline_input_ptr && platform_staged != nullptr) {
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1892,6 +2314,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // [TAG_STAGED_SPLIT] put the copy of the next split on the staging stream here, before this
+        // split's compute is submitted. staged_issue makes the copy wait for the compute stream, so
+        // issuing it after the submit would make it wait for this split and overlap with nothing.
+        // Issued here it waits only for the split before this one, whose barrier the previous
+        // iteration already passed, and it then runs while this split computes. Two slots make
+        // that safe: the slot the next copy writes is the one the previous split read.
+        if (platform_staged != nullptr && split_id + 1 > staged_next) {
+            staged_next = split_id + 1;
+            staged_issue(staged_next);
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1932,6 +2365,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     return ec;
                 }
 
+
                 // ask the GPU directly how long the range takes, before any CPU-side bookkeeping.
                 // only the CUDA-like backends implement event_record; CPU and CUDA_Host do not,
                 // and ggml_backend_event_record asserts on that.
@@ -1956,6 +2390,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        // [TAG_STAGED_SPLIT] the copy of the next split was issued above, before the barrier of
+        // this split's last range. If a callback cut that range loop short the copy is still
+        // pending here; issuing it now is worse than not at all, but it keeps the walk correct.
+        if (platform_staged != nullptr && split_id + 1 > staged_next) {
+            staged_next = split_id + 1;
+            staged_issue(staged_next);
         }
 
         // record the event of this split
@@ -2017,6 +2459,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
+    sched->pipeline = (ggml_backend_sched_split_pipeline *) calloc(initial_splits_capacity, sizeof(sched->pipeline[0]));
+    sched->pipeline_cap = initial_splits_capacity;
 
     sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
@@ -2057,6 +2501,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         free(sched->splits[i].inputs);
     }
     free(sched->splits);
+    for (int i = 0; i < sched->pipeline_cap; i++) {
+        if (sched->pipeline[i].ready != nullptr) {
+            ggml_backend_event_free(sched->pipeline[i].ready);
+        }
+    }
+    free(sched->pipeline);
+    if (sched->pipeline_buf != nullptr) {
+        ggml_backend_buffer_free(sched->pipeline_buf);
+    }
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);

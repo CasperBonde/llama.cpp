@@ -1193,16 +1193,31 @@ void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
 // Whether the tensor core MMQ path can be used on the device at hand. A build with
-// GGML_CUDA_TURING_NO_MMA has no Turing tensor core kernels at all, so it answers false. Without
-// that option this asks the plain cc question and the device flag is not consulted: the names it
-// covers were already treated as tensor core capable, and changing that would alter the path taken
-// on hardware this was never measured on.
+// GGML_CUDA_TURING_NO_MMA has no Turing tensor core kernels at all, so it answers false. Otherwise
+// this asks the device, not the cc: cc 75 covers TU117, which has no tensor cores, as well as
+// TU106/TU116, which do, and only the device info can tell them apart.
 static bool turing_mma_available_dev() {
 #ifdef GGML_CUDA_TURING_NO_MMA
     return false;
 #else
-    return turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    const int id = ggml_cuda_get_device();
+    if (!turing_mma_available(info.devices[id].cc)) {
+        return false;
+    }
+    return info.devices[id].tensor_cores;
 #endif // GGML_CUDA_TURING_NO_MMA
+}
+
+// Whether the device has usable tensor cores. Same question as turing_mma_available_dev, for the
+// device dispatch paths outside MMQ (flash attention, mul_mat_f, the lightning indexer) that used
+// to ask turing_mma_available directly and so assumed every cc 75 device had tensor cores.
+// false for devices older than cc 75 and for non-NVIDIA, matching turing_mma_available.
+static bool tensor_cores_available(const int cc) {
+    if (!turing_mma_available(cc)) {
+        return false;
+    }
+    return ggml_cuda_info().devices[ggml_cuda_get_device()].tensor_cores;
 }
 
 struct ggml_cuda_pool {
@@ -1458,6 +1473,12 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // [TAG_STAGED_SPLIT] stream the scheduler issues the early copy of the next split on. Separate
+    // from the compute stream, which is what lets that copy precede the compute of the split before
+    // it instead of queueing behind it. Created on first use.
+    cudaStream_t staged_stream = nullptr;
+    cudaEvent_t  staged_event  = nullptr; // compute -> copy ordering (slot reuse)
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1535,6 +1556,14 @@ struct ggml_backend_cuda_context {
     }
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
+
+    cudaStream_t staged_copy_stream() {
+        if (staged_stream == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&staged_stream, cudaStreamNonBlocking));
+        }
+        return staged_stream;
+    }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
